@@ -1,2 +1,287 @@
-# sidecar
-Sidecar（伴行）：通过自然语言驱动真实 App 界面操作的手机 Agent，旨在让用户正常使用手机的同时，由分身完成任务，不干扰前台操作。
+# Sidecar（伴行）
+
+通过自然语言驱动真实 App 界面操作的手机 Agent，旨在让用户正常使用手机的同时，由分身完成任务，不干扰前台操作。
+
+> 完整技术方案：[Sidecar 技术方案 v0.2（2026-10-11）](docs/technical-proposal.md)。包含当前架构、执行环境、手机入口、通知、验收与实际进度；当前能力及待修问题以方案第 10 节为准。[第 14 节](docs/technical-proposal.md#runtime-details) 详细说明状态、记忆、上下文、工作区、工具、沙箱、MCP、事件及恢复机制。下文保留早期核心阶段的设计和运行说明，部分后续计划尚未同步更新。
+
+> 早期核心里程碑：第一版 Agent Harness 核心通过了当时的 32 项自动化测试，提供本地离线演示与可配置模型适配器。这是历史阶段记录，不表示当前新增功能已全部验收。
+
+**DeepSeek 接入已加入代码：** 推荐配置 `deepseek-flash`，使用 JSON 模式并在本地校验结构化结果；详见 [DeepSeek 配置与验证说明](docs/deepseek.md)。密钥只需在本机配置，尚未进行真实 API 调用或真实 App 验收。
+
+## 当前可运行的内容
+
+- 基于 LangGraph 的单 Agent 观察、决策、执行、交接与验证流程。
+- 有类型的 GUI 动作、设备策略检查、操作前页面变化检查。
+- SQLite 检查点、任务状态、控制请求、事件记录和动作意图日志。
+- 在步骤边界暂停、取消；用户交还控制或崩溃恢复后重新观察。
+- 动作结果不确定时等待用户核对；同一工作目录中的未结束任务保留环境使用权。
+- 决策步数、无进展轮数与每次运行时间限制；只向模型提供最近八条动作摘要。
+- 可配置的 LangChain 模型适配器，以及无需密钥的规则演示。
+
+**离线演示是文字状态模拟，不是真实手机界面，也不是具备自然语言泛化能力的 Agent。** 它用于验证 Harness 的运行机制。真实模型模式使用同一个演示环境，可以测试模型决策，但仍不等于完成真实 App 验收。
+
+## 本地运行
+
+需要 macOS 或 Linux、Python 3.11+。当前开发环境为 macOS、Python 3.14；本地执行锁使用 Unix 文件锁，暂不支持 Windows。
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -e '.[dev]'
+sidecar demo --item '复习项目架构' --item '检查提交材料'
+```
+
+命令返回任务 ID、状态、验证结果及 `mode: offline_demo`。运行数据保存在 `.sidecar/`，已排除在 Git 之外。重复运行使用同一份演示清单，已有目标事项不会再次创建。
+
+`requirements-lock.txt` 记录本次验证环境的依赖版本。如需复用这些版本，将安装命令改为 `python -m pip install -c requirements-lock.txt -e '.[dev]'`；它是版本快照，不包含安装包哈希。
+
+### 查看记录与模拟交接
+
+将 `<任务ID>` 替换成运行结果中的 `task_id`；`--home` 位于子命令之前。
+
+```bash
+sidecar status <任务ID>
+sidecar events <任务ID>
+
+# 在单独的演示目录中模拟需要用户登录的场景
+sidecar --home .sidecar/handoff demo --require-login --item '整理材料'
+sidecar --home .sidecar/handoff demo-login
+sidecar --home .sidecar/handoff resume <任务ID> --note '已在演示环境中完成登录'
+```
+
+`demo-login` 仅改变离线演示状态，不涉及任何真实账号。恢复备注应说明已核对的结果；恢复不会重放被暂停的旧动作。进程中断后，也可以通过 `resume` 在人工核对后恢复。
+
+运行任务时，可从另一个终端请求控制：
+
+```bash
+sidecar pause <任务ID>
+sidecar cancel <任务ID>
+sidecar resume <任务ID> --note '已检查当前页面，继续'
+```
+
+暂停和取消在步骤边界生效，不能撤回已经开始的设备动作。取消请求不会被后来的暂停或恢复请求覆盖。已完成、失败或取消的任务不能继续。未结束的任务会阻止同一工作目录启动另一项任务。
+
+### 接入真实模型（可选）
+
+只有显式添加 `--llm` 并配置以下环境变量，才会调用模型。CLI 不自动读取 `.env` 文件。
+
+- `SIDECAR_MODEL`：模型名称。
+- `SIDECAR_API_KEY`：对应提供商的密钥，不要写进代码或提交 Git。
+- `SIDECAR_BASE_URL`：可选的兼容接口地址；不设置时使用 ChatOpenAI 默认端点。
+
+```bash
+sidecar --home .sidecar/model-demo demo --llm \
+  --goal '请把整理演示视频加入待办，保存后检查结果' \
+  --item '整理演示视频'
+```
+
+`--goal` 是自然语言目标，`--item` 定义本演示的明确验收条件。一般接口使用 JSON Schema 输出；官方 DeepSeek 接口使用 JSON 模式、提示词中的输出契约及本地校验。使用截图时还需支持图像输入。不同兼容接口需要分别验证，不能仅凭 API 格式相似保证可用。
+
+模型模式会向配置的提供商发送任务、当前观察和最近的动作摘要。凭据不进入模型消息；本地 Harness 禁用继承自全局环境的 LangSmith 追踪。截图可作为内联图像接入，但当前演示仅提供文字观察。尚未进行付费模型的在线验证。
+
+### 开发检查
+
+```bash
+python -m pytest -q
+ruff check src tests
+ruff format --check src tests
+```
+
+### 接入 Cherry Studio 等 OpenAI 兼容客户端
+
+Sidecar 提供 `/v1/models` 与 `/v1/chat/completions` 两个 OpenAI 兼容端点，可被 Cherry Studio 当作一个「模型」调用。
+
+启动服务（自动拉起独立 worker，浏览器关闭不影响任务）：
+
+```bash
+sidecar --home ~/.sidecar serve
+# 打印访问地址和配对码；配对码即 API Key
+```
+
+在 Cherry Studio 中添加自定义提供商：
+
+| 配置项 | 值 |
+| --- | --- |
+| Base URL | `http://127.0.0.1:8765/v1` |
+| API Key | 启动时打印的配对码 |
+| 模型 | `sidecar-agent` |
+
+在对话里发送任务描述，Sidecar 执行后在回复中返回结果。需要本人介入（登录、验证码、支付）时，回复会提示 `继续 <任务编号>`，在同一对话里回复该指令即可恢复任务。
+
+每次回复都带任务编号（响应 JSON 另有 `task_id` 字段）。等待超过 120 秒时，任务仍在后台执行；发送独立指令 `查询 <任务编号>` 可立即查看状态，也可携带同一 API Key 请求 `GET /api/tasks/<任务编号>`。查询不会恢复或创建任务。`继续 <任务编号>` 必须独占一条消息，允许首尾空白和冒号；句子中的引用或“请不要继续 …”不会触发恢复。
+
+相同模型与完整对话的重试会复用原任务，包括服务重启后和任务已结束时。若需有意再次执行相同内容，请发起新的对话轮次，或在请求头中提供新的 `Idempotency-Key`；同一次提交的重试应保持该 key 不变。同一个 key 不能用于不同任务目标（返回 409）。去重记录保存在当前 `--home` 的任务数据库中。
+
+**固定 API Key**：默认配对码持久化在 `--home` 目录下的 `pairing-token` 文件里，换目录启动会生成新 key。可用环境变量固定：
+
+```bash
+SIDECAR_PAIRING_TOKEN=你的固定key sidecar --home ~/.sidecar serve
+```
+
+或把 `SIDECAR_PAIRING_TOKEN=...` 写入 `.env` 并自行加载（项目不自动读取 `.env`，见 [.env.example](./.env.example)）。
+
+当前为**非流式**返回：一次请求同步等待任务到达终态、交接点或上述等待超时。`stream=true` 会在创建或恢复任务前返回 HTTP 400，并提示关闭流式输出。离线演示（demo 模式）秒级完成；真实 Android 任务耗时较长，请在 Cherry Studio 中关闭「流式输出」开关。
+
+## 代码结构与设备接入
+
+| 文件 | 内容 |
+| --- | --- |
+| `src/sidecar/contracts.py` | Task、Observation、Action、Verification 及设备/模型接口 |
+| `src/sidecar/harness.py` | LangGraph 执行、交接、恢复和验证流程 |
+| `src/sidecar/store.py` | SQLite 任务索引、控制请求、事件和动作日志 |
+| `src/sidecar/jobs.py` | 持久任务队列与执行配置 |
+| `src/sidecar/worker.py` | 独立执行进程，浏览器断开不取消任务 |
+| `src/sidecar/server.py` | 网页控制台与 REST API |
+| `src/sidecar/openai_compat.py` | OpenAI 兼容端点，供 Cherry Studio 接入 |
+| `src/sidecar/model.py` | LangChain 结构化输出与受限上下文 |
+| `src/sidecar/android.py` | Android 设备适配（uiautomator2） |
+| `src/sidecar/android_rpc.py` | Android 一次性 RPC 子进程传输 |
+| `src/sidecar/demo.py` | 明确标注的离线模拟设备与规则策略 |
+| `src/sidecar/cli.py` | 运行、查看、交接、暂停、取消与 `serve` 入口 |
+| `src/sidecar/static/` | 手机控制台前端 |
+| `tests/` | 核心行为、模型边界、队列、服务与 OpenAI 端点测试 |
+
+真实设备适配器需实现 `Device` 接口：稳定的 `device_id`，以及 `observe()`、`assess(action, observation)`、`execute(action)`。`observe()` 返回最新截图和/或界面元素；`assess()` 由可信适配器判定允许、拒绝或交接；`execute()` 执行一个有超时约束的动作。坐标点击使用 0–1 的归一化坐标，需由适配器换算。
+
+当前单执行者锁只覆盖同一工作目录；接入真实设备时还需统一设备实例的控制入口，不能用不同目录绕过互斥。设备方法必须自行实现超时，本阶段时间预算是步骤边界检查，不会强制终止任意设备调用。
+
+任务验收目前包含结构化逐项证据检查，不能保证模型对截图的判断一定正确；真实 App 接入后仍需增加针对目标内容的验证和跨端结果检查。SQLite 中保存的任务、动作文本及观察可能包含私人信息，应使用测试账号并按需清理运行目录。
+
+设计与实施记录：[核心设计](docs/core-design.md)、[实施计划与审查结果](docs/superpowers/plans/2026-10-10-agent-core.md)。
+
+## 项目目标
+
+- 接受自然语言任务，根据实时界面决定下一步，能够处理加载、弹窗和页面变化。
+- 在真实第三方 App 中完成多步操作，结果作用于用户自己的账号。
+- 用户持续使用 iPhone 时，Agent 同时执行，不切换用户前台 App、不抢键盘和焦点。
+- 用户可以查看实际执行画面、暂停、取消和接管任务。
+- 遇到登录、验证码、支付等需要本人处理的步骤，保留现场并等待用户主动介入。
+- 通过实际界面证据验证结果；等待交接时，明确已经完成的部分和剩余步骤。
+
+首版建议聚焦一个用户、一个执行设备、一个第三方 App、一次一个任务。候选场景是创建清单和待办事项，具体 App 尚未确定。
+
+## Agent 架构
+
+采用 **面向 GUI 的轻量 Agent Harness**，内部使用单 Agent 的 ReAct 风格观察—行动循环，底层由 LangGraph 管理执行。ReAct 描述决策方式；Harness 负责上下文、动作约束、交接、恢复、预算和验证，两者可以同时使用。
+
+规划用于明确目标、约束和完成标准；每一步界面操作由最新观察决定。首版不预先写死完整点击序列，也不引入多 Agent 协作。
+
+```mermaid
+flowchart TD
+    A[用户自然语言任务] --> B[明确目标与完成标准]
+    B --> C[观察当前 App 界面]
+    C --> D[Agent 决定下一步]
+    D --> E[检查动作与权限]
+    E -->|允许执行| F[设备适配层执行动作]
+    F --> C
+    E -->|需要本人介入| G[暂停并请求用户交接]
+    G -->|用户交还控制| C
+    D -->|认为目标已达成| H[读取新证据并验证结果]
+    H -->|尚未完成| C
+    H -->|验证通过| I[报告完成与证据]
+```
+
+### 模块分工
+
+| 模块 | 职责 |
+| --- | --- |
+| 目标规划 | 提取任务目标、约束和可验证的完成标准 |
+| 观察 | 获取最新截图，按设备能力补充界面元素信息 |
+| 决策 | 根据目标、当前界面、近期动作及其结果，选择下一步操作 |
+| 执行控制 | 检查动作参数和权限，管理暂停、取消、超时和重试上限 |
+| 设备适配 | 将观察、点击、输入、滑动等统一操作映射到具体设备工具 |
+| 结果验证 | 使用新观察核对完成标准，保存证据，区分完成、失败和等待交接 |
+
+这些模块不等于多个独立 Agent。首版可以由一个主要决策模型配合程序规则完成。
+
+### 执行规则
+
+- 每次改变界面后重新观察，避免依据旧截图连续操作。
+- 模型提出动作，由程序检查后执行；界面中的文本不能自行成为新的用户指令。
+- 用户接管期间停止 Agent 操作；交还控制后重新读取页面。
+- 连续失败、重复停留同一页面或超过任务预算时，停止尝试并报告原因。
+- 创建、发送等动作超时后，先核对是否已经成功，避免重复提交。
+- 模型声明完成时进入验证阶段，验证通过后才能将任务标记为完成。
+
+当前核心状态包括：`running`、`waiting_user`、`paused`、`completed`、`failed`、`cancelled`。验证作为图中的独立节点执行；待执行队列和面向用户的状态展示留待后续实现。
+
+## 框架与技术选型
+
+当前推荐：**使用 Python 开发，LangGraph 管理执行流程，按需使用 LangChain 的模型与工具组件，独立设备适配层负责操作 App。**
+
+| 层次 | 当前建议 | 说明 |
+| --- | --- | --- |
+| 开发语言 | Python | 编写 Agent、后端和设备适配逻辑 |
+| Agent 流程 | LangGraph | 显式组织观察、决策、执行、交接和验证流程 |
+| 模型与工具接口 | LangChain 相关组件，按需引入 | 复用模型接入与工具定义能力 |
+| 决策模型 | 待选 | 需要验证图片理解、动作输出、延迟、成本及目标 App 上的效果 |
+| 后端接口 | FastAPI，暂定 | 接收任务、提供状态和控制入口 |
+| 持久化 | SQLite＋本地截图文件，暂定 | 保存任务状态、检查点、操作记录与证据 |
+| 手机入口 | 适配 Safari 的网页，暂定 | 提交任务、查看进度、请求暂停和处理交接 |
+| 设备操作 | 依执行环境选择 | iOS 与 Android 路线仍在比较，不预先锁定工具 |
+
+### 为什么使用 LangGraph，也保留 LangChain
+
+LangChain 与 LangGraph 并非互斥选择。当前 LangChain 的 `create_agent` 建立在 LangGraph 上，也能使用持久化和人工介入能力。
+
+| 方式 | 特点 | 在本项目中的考虑 |
+| --- | --- | --- |
+| LangChain `create_agent` | 通过模型、工具和中间件构建 Agent 循环 | 标准循环能满足需求时，可以采用 |
+| 自定义 LangGraph | 明确定义节点、分支及状态转换 | 当前优先推荐，便于检查界面操作顺序、恢复逻辑和完成条件 |
+| 自定义 LangGraph＋LangChain 组件 | 自定义流程，同时复用模型与工具接口 | 当前建议的组合方式 |
+
+选择 LangGraph 的原因，是希望明确保证“动作后重新观察”“用户接管时停止”“提交超时后核对结果”“完成前验证”等执行规则。LangChain 也可以通过工具和中间件实现这些规则；两者的取舍在于流程控制方式，而非是否具备 Agent 能力。
+
+如果采用自定义 LangGraph，首版不再额外嵌套完整的 `create_agent` 循环，以免产生两套难以追踪的循环与状态。
+
+LangGraph 的持久化保存的是程序状态，不会让 App 界面回到过去。恢复时部分节点可能重新执行，因此仍需设计操作记录、结果核对和重新观察机制；框架不自动保证界面动作只执行一次。
+
+## 执行环境：待确定
+
+Agent 架构与设备控制实现分开设计。当前讨论方向是：**iPhone 作为日常使用与任务入口，Mac 或另一台设备提供独立的执行环境。**
+
+| 候选路线 | 优点 | 必须验证的条件 |
+| --- | --- | --- |
+| iPhone＋Mac 上的 Android 模拟器 | 执行画面容易展示，便于调试 | 目标 App 安装、运行、登录、跨端同步和性能 |
+| iPhone＋Mac 上的 iOS 模拟器 | 保留 iOS 界面环境 | 获得第三方 App 的模拟器构建，或能从源码编译并连接真实服务 |
+| iPhone＋Mac 直接运行兼容 iOS App | 有机会使用正式发布的 iOS App | 开发者允许在 Mac 提供该 App，且可自动操作、同步结果；需明确其运行形态与题目要求的关系 |
+| iPhone＋独立 Android 真机 | 使用真实手机环境 | 额外设备、自动操作能力和账号并存 |
+
+iOS 模拟器不能按普通 iPhone 的方式直接安装任意 App Store App。模拟器版本与真机安装包的目标平台不同；Mac 直接运行兼容 iOS App 则属于另一种运行方式。
+
+目前未验证在同一台未越狱 iPhone 内后台操作任意第三方 App、同时满足前台不受干扰的方案，因此不将其作为首版承诺。
+
+题目允许模拟器、云手机或第二台设备。如果采用跨设备方案，需要清楚说明执行位置，并通过用户同一账号中的真实结果证明任务完成。统一设备接口也不意味着各平台可以直接互换，仍需分别适配和测试。
+
+## 首版验收建议
+
+1. 用户在 iPhone 上持续打字或浏览时，Agent 在独立环境中同期执行任务。
+2. 演示同时展示用户操作和第三方 App 的真实执行画面，不仅展示进度文字。
+3. 更换任务内容或初始页面后，Agent 能基于实时观察调整操作。
+4. 执行端重新打开目标内容核对结果，并在 iPhone 同账号中检查同步情况。
+5. 需要用户介入时，能够暂停、说明完成边界，并在交还控制后重新观察和继续。
+
+以上是验收目标，尚无实测结果。任务是否能够跨端同步，取决于最终选定的第三方 App。
+
+## 下一步需要共同确定
+
+- 首个目标 App、任务内容与完成标准。
+- 执行环境，以及安装、登录和跨端同步的可行性。
+- 观察方式：纯截图，或截图结合界面元素信息。
+- 模型选择、费用和任务时间预算。
+- 手机端查看进度、暂停、取消、接管与通知的具体交互。
+- 失败恢复、重复提交防护、凭据处理与日志保留规则。
+
+通用核心已开始实现。上述产品与设备层设计达成共识后，再推进真实 App 接入和手机端交互；不会将离线演示作为题目要求的最终交付。
+
+## 参考资料
+
+- [LangChain 概览与 LangGraph 的关系](https://docs.langchain.com/oss/python/langchain/overview)
+- [LangChain 人工介入机制](https://docs.langchain.com/oss/python/langchain/human-in-the-loop)
+- [LangGraph 概览](https://docs.langchain.com/oss/python/langgraph/overview)
+- [LangGraph 暂停与恢复](https://docs.langchain.com/oss/python/langgraph/interrupts)
+- [LangGraph 持久化](https://docs.langchain.com/oss/python/langgraph/persistence)
+- [Anthropic：Building effective agents](https://www.anthropic.com/engineering/building-effective-agents)
+- [Apple：模拟器交互与 App 安装限制（归档文档）](https://developer.apple.com/library/archive/documentation/IDEs/Conceptual/iOS_Simulator_Guide/InteractingwiththeiOSSimulator/InteractingwiththeiOSSimulator.html)
+- [Apple：在 Mac 上运行 iOS App](https://developer.apple.com/documentation/apple-silicon/running-your-ios-apps-in-macos)
+- [Android Emulator 官方说明](https://developer.android.com/studio/run/emulator)
