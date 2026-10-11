@@ -1,0 +1,182 @@
+# 命令行入口：离线演示、模型演示、设备观察和网页服务共用项目配置。
+"""Local CLI for demo, Android observation, and the phone console."""
+
+import argparse
+import json
+import os
+from pathlib import Path
+from uuid import uuid4
+
+from sidecar.contracts import Task
+from sidecar.demo import PREFIX, DemoDevice, DemoPolicy
+from sidecar.harness import Harness
+from sidecar.model import LangChainModel
+
+
+# 以可读 JSON 输出结果，保留中文，方便终端查看及其他程序解析。
+def emit(value):
+    print(json.dumps(value, ensure_ascii=False, indent=2))
+
+
+# 集中定义子命令；--home 是所有模式共用的运行数据目录。
+def parser():
+    root = argparse.ArgumentParser(description="Sidecar GUI Harness")
+    root.add_argument("--home", type=Path, default=Path(".sidecar"))
+    commands = root.add_subparsers(dest="command", required=True)
+    demo = commands.add_parser("demo", help="Run a simulated task; no real phone is controlled")
+    demo.add_argument("--item", action="append")
+    demo.add_argument("--require-login", action="store_true")
+    demo.add_argument(
+        "--llm", action="store_true", help="Send demo observations to configured model"
+    )
+    demo.add_argument("--goal", help="Natural-language goal (requires --llm)")
+    resume = commands.add_parser("resume")
+    resume.add_argument("task_id")
+    resume.add_argument("--note", required=True)
+    for name in ("status", "events", "pause", "cancel"):
+        commands.add_parser(name).add_argument("task_id")
+    commands.add_parser("demo-login", help="Simulate the user logging in; no real account involved")
+    observe = commands.add_parser("observe", help="Read an Android screen locally; no model call")
+    observe.add_argument("--serial", default="emulator-5554")
+    observe.add_argument("--package", required=True)
+    observe.add_argument("--output", type=Path)
+    serve = commands.add_parser("serve", help="Start phone console and independent task worker")
+    serve.add_argument("--host", default="127.0.0.1")
+    serve.add_argument("--port", type=int, default=8765)
+    serve.add_argument("--android", action="store_true")
+    serve.add_argument("--serial", default="emulator-5554")
+    serve.add_argument("--package", default="")
+    worker = commands.add_parser("worker", help="Run the queue worker independently")
+    worker.add_argument("--once", action="store_true")
+    return root
+
+
+# 根据命令选择观察、worker、网页或演示路径，并统一处理可读错误。
+def main():
+    args = parser().parse_args()
+    try:
+        home = args.home.resolve()
+        # 只读设备检查：在本地保存截图，不调用模型或执行点击。
+        if args.command == "observe":
+            import base64
+
+            from sidecar.android import AndroidDevice
+
+            device = AndroidDevice(args.serial, args.package)
+            with device.execution_lock():
+                observation = device.observe()
+            output = args.output or home / "android-screen.png"
+            if observation.image:
+                output.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                output.write_bytes(base64.b64decode(observation.image.split(",", 1)[1]))
+            emit(
+                {
+                    "device": device.device_id,
+                    "requires_human": observation.requires_human,
+                    "elements": len(observation.elements),
+                    "image": str(output.resolve()) if observation.image else None,
+                }
+            )
+            return
+        if args.command == "worker":
+            from sidecar.worker import run_worker
+
+            run_worker(home, args.once)
+            return
+        # 网页服务负责收发请求；另起 worker，使浏览器断开后任务仍可继续。
+        if args.command == "serve":
+            import uvicorn
+
+            from sidecar.jobs import JobQueue, Settings
+            from sidecar.server import create_app, pairing_token, start_worker
+
+            config = Settings(
+                mode="android" if args.android else "demo",
+                serial=args.serial,
+                package=args.package,
+                model=os.environ.get("SIDECAR_MODEL", ""),
+                base_url=os.environ.get("SIDECAR_BASE_URL", ""),
+            )
+            if args.android and not os.environ.get("SIDECAR_API_KEY"):
+                raise ValueError("Android 模式需要显式配置 SIDECAR_API_KEY")
+            JobQueue(home).configure(config)
+            token = pairing_token(home)
+            start_worker(home)
+            print(f"Sidecar: http://{args.host}:{args.port}\n配对码: {token}", flush=True)
+            uvicorn.run(create_app(home, token), host=args.host, port=args.port, access_log=False)
+            return
+        # 下面的命令使用离线模拟设备；真实手机任务通过网页队列进入 worker。
+        device = DemoDevice(home)
+        if args.command in {"status", "events", "pause", "cancel", "demo-login"}:
+            with Harness(home, device, DemoPolicy()) as agent:
+                if args.command == "status":
+                    emit(agent.status(args.task_id))
+                elif args.command == "events":
+                    emit(agent.events(args.task_id))
+                elif args.command == "demo-login":
+                    with agent.store.execution_lock():
+                        state = device.load()
+                        state["logged_in"] = True
+                        device.save(state)
+                    emit({"mode": "offline_demo", "logged_in": True})
+                else:
+                    agent.control(args.task_id, args.command)
+                    emit({"task_id": args.task_id, "requested": args.command})
+            return
+
+        if args.command == "demo":
+            if args.goal and not args.llm:
+                raise ValueError("--goal requires --llm; offline policy is not a language model")
+            items = args.item or ["复习项目架构", "整理演示视频"]
+            task = Task(
+                goal=args.goal or "创建以下待办：" + "、".join(items),
+                criteria=[PREFIX + item for item in items],
+            )
+            task_id = uuid4().hex
+            metadata = {
+                "mode": "llm_demo" if args.llm else "offline_demo",
+                "model": os.environ.get("SIDECAR_MODEL") if args.llm else None,
+                "base_url": os.environ.get("SIDECAR_BASE_URL") if args.llm else None,
+            }
+        else:
+            task_id = args.task_id
+            if not task_id.isalnum():
+                raise ValueError("invalid task id")
+            metadata_path = home / "runs" / f"{task_id}.json"
+            if not metadata_path.exists():
+                raise ValueError("unknown demo task")
+            metadata = json.loads(metadata_path.read_text())
+            if metadata["mode"] == "llm_demo" and (
+                metadata["model"] != os.environ.get("SIDECAR_MODEL")
+                or metadata["base_url"] != os.environ.get("SIDECAR_BASE_URL")
+            ):
+                raise ValueError("resume requires the original model and endpoint configuration")
+
+        model = LangChainModel.from_env() if metadata["mode"] == "llm_demo" else DemoPolicy()
+
+        # 在任务获准启动后保存演示元信息，必要时模拟等待用户登录。
+        def prepare_demo():
+            # Runs after task admission, under the executor lock.
+            runs = home / "runs"
+            runs.mkdir(exist_ok=True)
+            (runs / f"{task_id}.json").write_text(json.dumps(metadata))
+            if args.require_login:
+                state = device.load()
+                state["logged_in"] = False
+                device.save(state)
+
+        with Harness(home, device, model) as agent:
+            result = (
+                agent.start(task, task_id, prepare=prepare_demo)
+                if args.command == "demo"
+                else agent.resume(task_id, args.note)
+            )
+            emit({**result, "mode": metadata["mode"]})
+            if result["status"] == "failed":
+                raise SystemExit(1)
+    except (ValueError, RuntimeError, OSError) as exc:
+        parser().exit(2, f"Sidecar: {exc}\n")
+
+
+if __name__ == "__main__":
+    main()
