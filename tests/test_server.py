@@ -39,3 +39,26 @@ def test_server_rejects_bad_task_and_unknown_task(tmp_path):
             c.post("/api/tasks", headers=headers, json={"goal": "", "items": []}).status_code == 422
         )
         assert c.get("/api/tasks/missing", headers=headers).status_code == 404
+
+
+def test_config_exposes_allow_list_and_task_app_is_validated(tmp_path):
+    from sidecar.jobs import JobQueue, Settings
+
+    JobQueue(tmp_path).configure(
+        Settings(mode="android", package="com.a", allowed_packages=["com.a", "com.b"], model="m")
+    )
+    headers = {"Authorization": "Bearer test-pairing-secret"}
+    with client(tmp_path) as c:
+        data = c.get("/api/config", headers=headers).json()
+        assert data["allowed_packages"] == ["com.a", "com.b"]
+        assert data["package"] == "com.a"
+        # 目标 App 越界时，提交阶段返回可解释的 409，而不是排队后失败。
+        rejected = c.post(
+            "/api/tasks", headers=headers, json={"goal": "任务", "app": "com.evil"}
+        )
+        assert rejected.status_code == 409
+        accepted = c.post(
+            "/api/tasks", headers=headers, json={"goal": "任务", "app": "com.b"}
+        )
+        assert accepted.status_code == 201
+        assert accepted.json()["request"]["app"] == "com.b"

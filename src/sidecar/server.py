@@ -122,7 +122,9 @@ def create_app(home, token=None):
         return {
             "mode": value.mode,
             "package": value.package,
+            "allowed_packages": value.allowed_packages,
             "serial": value.serial,
+            "hidden_display": value.display is not None,
             "worker_online": worker_alive(q.home),
             "background_push": False,
         }

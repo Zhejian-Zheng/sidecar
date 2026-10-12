@@ -2,6 +2,7 @@
 """Persistent single-device queue shared by the HTTP server and worker."""
 
 import json
+import re
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
@@ -12,31 +13,48 @@ from pydantic import Field, model_validator
 
 from sidecar.contracts import Message, Task
 from sidecar.demo import PREFIX, DemoDevice, DemoPolicy
+from sidecar.displays import DisplayBinding
 from sidecar.harness import TERMINAL, Harness
 from sidecar.store import Store
 
 
 # 保存执行模式、设备和模型名称等配置，不在队列配置中保存密钥。
+# allowed_packages 是唯一允许操作的 App 白名单；package 是未指定任务目标时的默认项。
 class Settings(Message):
     mode: Literal["demo", "android"] = "demo"
     serial: str = "emulator-5554"
     package: str = ""
+    allowed_packages: list[str] = Field(default_factory=list, max_length=20)
     model: str = ""
     base_url: str = ""
+    display: DisplayBinding | None = None
 
-    # Android 模式必须指定目标 App 和模型，离线演示则不需要。
+    # Android 模式必须至少一个允许的 App 和模型；package 自动并入允许列表。
     @model_validator(mode="after")
     def validate_mode(self):
-        if self.mode == "android" and (not self.package or not self.model):
-            raise ValueError("Android 模式需要配置目标 App 包名和模型")
+        if self.display and self.mode != "android":
+            raise ValueError("隐藏执行屏只能用于 Android 模式")
+        if self.mode == "android":
+            allowed = list(dict.fromkeys(self.allowed_packages))
+            if self.package and self.package not in allowed:
+                allowed.insert(0, self.package)
+            if not allowed:
+                raise ValueError("Android 模式需要至少一个允许的 App 包名")
+            if not self.model:
+                raise ValueError("Android 模式需要配置模型")
+            if any(not re.fullmatch(r"[\w.]+", name) for name in allowed):
+                raise ValueError("App 包名格式不正确")
+            self.allowed_packages = allowed
+            self.package = self.package or allowed[0]
         return self
 
 
-# 校验网页任务输入；request_id 用于识别同一次提交的重试。
+# 校验网页任务输入；app 指定本任务的目标 App，request_id 用于识别同一次提交的重试。
 class Submission(Message):
     goal: str = Field(min_length=1, max_length=4000)
     items: list[str] = Field(default_factory=list, max_length=20)
     criteria: list[str] = Field(default_factory=list, max_length=20)
+    app: str | None = Field(default=None, max_length=200)
     request_id: str | None = Field(default=None, max_length=100)
 
 
@@ -89,17 +107,32 @@ class JobQueue:
             row = db.execute("SELECT body FROM settings WHERE id=1").fetchone()
         return Settings.model_validate_json(row[0]) if row else Settings()
 
-    # 校验输入并入队；相同提交编号只允许复用同一份任务内容。
-    def submit(self, goal, items=None, criteria=None, request_id=None):
+    # 解析任务的目标 App：显式 app 优先，否则用默认 package；必须落在允许列表内。
+    def target_package(self, request, settings=None):
+        settings = settings or self.settings()
+        target = request.get("app") or settings.package
+        if target not in settings.allowed_packages:
+            raise ValueError(f"目标 App 不在允许列表：{target}")
+        return target
+
+    # 校验输入并入队；任务级 app 越界时在提交阶段就拒绝。
+    def submit(self, goal, items=None, criteria=None, app=None, request_id=None):
         request = Submission(
-            goal=goal, items=items or [], criteria=criteria or [], request_id=request_id
+            goal=goal,
+            items=items or [],
+            criteria=criteria or [],
+            app=app,
+            request_id=request_id,
         )
-        if self.settings().mode == "demo":
+        settings = self.settings()
+        if settings.mode == "demo":
             if not request.items:
                 raise ValueError("离线演示需要至少一条待办事项")
             Task(goal=goal, criteria=[PREFIX + x for x in request.items])
-        elif request.criteria:
-            Task(goal=goal, criteria=request.criteria)
+        else:
+            self.target_package(request.model_dump(), settings)
+            if request.criteria:
+                Task(goal=goal, criteria=request.criteria)
         body = request.model_dump_json(exclude={"request_id"})
         with self.db() as db:
             db.execute("BEGIN IMMEDIATE")

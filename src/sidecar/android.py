@@ -11,47 +11,86 @@ from pathlib import Path
 from xml.etree import ElementTree as ET
 
 from sidecar.contracts import Action, Observation
+from sidecar.displays import DisplayBinding
 
 SENSITIVE = re.compile(
-    r"password|sign in|log in|verification code|pay now|purchase|delete|remove account|"
-    r"密码|登录|验证码|立即支付|确认支付|确认付款|删除|注销",
+    r"password|sign in|log in|verification code|pay now|purchase|remove account|"
+    r"\bsend\b|\btransfer\b|\bpublish\b|"
+    r"密码|登录|验证码|支付|付款|购买|转账|发送|发布|注销",
     re.I,
 )
+DESTRUCTIVE = re.compile(r"delete|删除", re.I)
 
 
 # 封装设备 RPC 子进程，避免设备调用无限阻塞主执行流程。
 class Transport:
     # 固定目标设备编号，防止多设备连接时误选手机。
-    def __init__(self, serial):
+    def __init__(self, serial, display=None, package=None):
         self.serial = serial
+        self.display = display
+        self.package = package
 
     # 通过标准输入传 JSON，限制调用时长；设备写入超时须按结果不确定处理。
     def call(self, op, payload=None):
         # Never use shell interpolation. Timeouts of writes remain uncertain.
-        result = subprocess.run(
-            [sys.executable, "-m", "sidecar.android_rpc"],
-            input=json.dumps({"serial": self.serial, "op": op, "payload": payload or {}}),
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        if result.returncode:
-            raise RuntimeError("Android connection failed; check ADB and device permissions")
-        return json.loads(result.stdout)
+        # 读页面在切换动画/重连时可能失败，最多重新采集一次，绝不重放写入。
+        attempts = 2 if op == "observe" else 1
+        for attempt in range(attempts):
+            try:
+                result = subprocess.run(
+                    [sys.executable, "-m", "sidecar.android_rpc"],
+                    input=json.dumps(
+                        {
+                            "serial": self.serial,
+                            "op": op,
+                            "payload": payload or {},
+                            "display": self.display.model_dump() if self.display else None,
+                            "package": self.package,
+                        }
+                    ),
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                if result.returncode:
+                    raise RuntimeError(
+                        "Android connection failed; check ADB and device permissions"
+                    )
+                return json.loads(result.stdout)
+            except (RuntimeError, subprocess.TimeoutExpired):
+                if attempt == attempts - 1:
+                    raise
 
 
 # 将允许的 App、控件定位和设备锁接入通用 Device 接口。
 class AndroidDevice:
-    # 校验设备及包名格式，并初始化最近一次观察的控件缓存。
-    def __init__(self, serial, package, transport=None, lock_root=None):
+    # 校验设备、任务目标 App 与允许列表，并初始化最近一次观察的控件缓存。
+    def __init__(self, serial, package, transport=None, lock_root=None, display=None, allowed=None):
         if not re.fullmatch(r"[\w.:-]+", serial) or not re.fullmatch(r"[\w.]+", package):
             raise ValueError("Invalid device serial or app package")
         self.serial, self.package = serial, package
+        # 允许列表是执行侧的安全边界：任务目标必须落在其中，且不能为空。
+        self.allowed = list(dict.fromkeys(allowed)) if allowed else [package]
+        if any(not re.fullmatch(r"[\w.]+", name) for name in self.allowed):
+            raise ValueError("Invalid allowed package name")
+        if package not in self.allowed:
+            raise ValueError("Target app is outside the allowed package list")
         self.device_id = f"android:{serial}:{package}"
-        self.transport = transport or Transport(serial)
+        self.display = DisplayBinding.model_validate(display) if display is not None else None
+        if self.display:
+            self.device_id += (
+                ":display:"
+                + hashlib.sha256(self.display.model_dump_json().encode()).hexdigest()[:20]
+            )
+        self.transport = transport or Transport(serial, self.display, package)
         self.lock_root = Path(lock_root or Path.home() / ".cache" / "sidecar" / "devices")
         self.nodes = {}
         self.latest = None
+        self.blocked_bounds = []
+
+    # 仅打开配置中批准的目标 App，不接受模型指定任意包名。
+    def launch(self):
+        self.transport.call("launch", {"package": self.package})
 
     # 按设备编号加文件锁，限制同一用户下同时操作该设备的执行者。
     @contextmanager
@@ -75,19 +114,32 @@ class AndroidDevice:
     # 解析控件树和截图，识别交接条件，并缓存本次可操作控件。
     def observe(self):
         data = self.transport.call("observe")
+        if self.display and data.get("display") != self.display.model_dump():
+            raise RuntimeError("Observation does not belong to the configured hidden display")
         root = ET.fromstring(data["xml"])
-        nodes, lines = {}, []
+        nodes, lines, occurrences = {}, [], {}
+        self.blocked_bounds = []
         sensitive = False
-        for index, node in enumerate(root.iter("node")):
+        for node in root.iter("node"):
             attrs = node.attrib
             label = (attrs.get("text", "") + " " + attrs.get("content-desc", "")).strip()
             password = attrs.get("password") == "true"
             sensitive |= password or bool(SENSITIVE.search(label))
+            bounds = [int(n) for n in re.findall(r"\d+", attrs.get("bounds", ""))]
+            valid_bounds = len(bounds) == 4 and bounds[2] > bounds[0] and bounds[3] > bounds[1]
+            if DESTRUCTIVE.search(label):
+                if valid_bounds:
+                    self.blocked_bounds.append(bounds)
+                else:
+                    sensitive = True
             # Do not expose credentials, including the screenshot, to the model.
             if password:
                 label = "[private input]"
             if label:
-                lines.append(label[:300])
+                state = ""
+                if attrs.get("checkable") == "true":
+                    state = f" [checked={str(attrs.get('checked') == 'true').lower()}]"
+                lines.append(label[:300] + state)
             # 只限制交给模型的可操作控件；敏感检测仍遍历整棵树。
             if len(nodes) >= 200:
                 continue
@@ -97,20 +149,39 @@ class AndroidDevice:
                 continue
             if attrs.get("package") != self.package:
                 continue
-            bounds = [int(n) for n in re.findall(r"\d+", attrs.get("bounds", ""))]
-            if len(bounds) != 4 or bounds[2] <= bounds[0] or bounds[3] <= bounds[1]:
+            if not valid_bounds:
                 continue
-            identity = f"{index}:{attrs.get('resource-id')}:{attrs.get('class')}"
-            key = hashlib.sha256(identity.encode()).hexdigest()[:12]
+            # 状态栏等无关节点增减不应改变目标编号；位置或目标状态改变仍会失效。
+            identity = json.dumps([attrs.get("resource-id"), attrs.get("class"), bounds])
+            occurrence = occurrences.get(identity, 0)
+            occurrences[identity] = occurrence + 1
+            key = hashlib.sha256(f"{identity}:{occurrence}".encode()).hexdigest()[:12]
             nodes[key] = dict(
                 label=label[:300],
                 bounds=bounds,
                 editable="EditText" in attrs.get("class", ""),
                 focused=attrs.get("focused") == "true",
+                checked=attrs.get("checked") == "true",
+                selected=attrs.get("selected") == "true",
             )
+            if self.display:
+                nodes[key]["selector"] = dict(
+                    resource_id=attrs.get("resource-id", ""),
+                    class_name=attrs.get("class", ""),
+                    bounds=bounds,
+                    old_text=attrs.get("text", ""),
+                    description=attrs.get("content-desc", ""),
+                )
         self.nodes = nodes
         context = f"App: {data['package']}\nActivity: {data.get('activity', '')}\n"
-        requires_human = sensitive or data["package"] != self.package
+        if self.display:
+            context += (
+                "Hidden display: type requires an explicit editable target; replaces its text.\n"
+            )
+        # 前台既不是本任务的目标 App，也不在允许列表内时，一律交接给用户。
+        foreground = data["package"]
+        out_of_scope = foreground not in self.allowed or foreground != self.package
+        requires_human = sensitive or out_of_scope
         obs = Observation(
             text=(context + "\n".join(lines))[:16000],
             elements={k: json.dumps(v, ensure_ascii=False) for k, v in nodes.items()},
@@ -124,8 +195,25 @@ class AndroidDevice:
     def assess(self, action, observation):
         if observation.requires_human:
             return "handoff"
+        if self.display and action.kind == "type" and not action.target:
+            return "handoff"
         if action.target and action.target not in self.nodes:
             return "deny"
+        # 删除入口可以与普通内容共存，但仅允许不与其区域重叠的显式控件动作。
+        # 坐标、滑动、返回及无目标输入无法证明与删除无关，仍交接。
+        if self.blocked_bounds and action.kind != "wait":
+            node = self.nodes.get(action.target)
+            if not node or action.kind not in {"tap", "type"}:
+                return "handoff"
+            left, top, right, bottom = node["bounds"]
+            if any(
+                left < blocked_right
+                and right > blocked_left
+                and top < blocked_bottom
+                and bottom > blocked_top
+                for blocked_left, blocked_top, blocked_right, blocked_bottom in self.blocked_bounds
+            ):
+                return "handoff"
         if action.kind == "type":
             node = (
                 self.nodes.get(action.target)
@@ -161,4 +249,6 @@ class AndroidDevice:
         payload = action.model_dump()
         if node:
             payload["bounds"] = node["bounds"]
+            if self.display and action.kind == "type":
+                payload["selector"] = node["selector"]
         self.transport.call("execute", payload)

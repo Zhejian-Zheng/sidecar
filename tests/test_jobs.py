@@ -91,7 +91,7 @@ def test_resume_preserves_original_plan(tmp_path, monkeypatch):
     device.save(state)
     monkeypatch.setenv("SIDECAR_MODEL", "test")
     monkeypatch.delenv("SIDECAR_BASE_URL", raising=False)
-    monkeypatch.setattr("sidecar.android.AndroidDevice", lambda *args: device)
+    monkeypatch.setattr("sidecar.android.AndroidDevice", lambda *args, **kwargs: device)
     monkeypatch.setattr("sidecar.worker.LangChainModel.from_env", lambda: model)
     q = JobQueue(tmp_path)
     q.configure(Settings(mode="android", package="com.example.todo", model="test"))
@@ -202,3 +202,102 @@ def test_cancel_and_finish_from_concurrent_connections(tmp_path):
         accepted = cancellation.result(timeout=10)
         completion.result(timeout=10)
     assert q.get(task_id)["status"] == ("cancelled" if accepted else "completed")
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+def test_new_android_task_launches_app_unless_cancelled(tmp_path, monkeypatch, cancel):
+    from sidecar.contracts import Task
+    from sidecar.demo import PREFIX, DemoDevice, DemoPolicy
+    from sidecar.jobs import JobQueue, Settings
+    from sidecar.worker import run_next
+
+    class Device(DemoDevice):
+        launched = False
+
+        def launch(self):
+            self.launched = True
+
+        def observe(self):
+            assert self.launched
+            return super().observe()
+
+    class Model(DemoPolicy):
+        def plan(self, goal):
+            if cancel:
+                q.control(job["id"], "cancel")
+            return Task(goal=goal, criteria=[PREFIX + "测试"])
+
+    d = Device(tmp_path / "engine")
+    monkeypatch.setenv("SIDECAR_MODEL", "test")
+    monkeypatch.delenv("SIDECAR_BASE_URL", raising=False)
+    monkeypatch.setattr("sidecar.android.AndroidDevice", lambda *args, **kwargs: d)
+    monkeypatch.setattr("sidecar.worker.LangChainModel.from_env", lambda: Model())
+    q = JobQueue(tmp_path)
+    q.configure(Settings(mode="android", package="com.example.todo", model="test"))
+    job = q.submit("测试")
+    run_next(tmp_path)
+    assert d.launched is not cancel
+    assert q.get(job["id"])["status"] == ("cancelled" if cancel else "completed")
+
+
+def test_allowed_packages_folds_default_and_validates():
+    from sidecar.jobs import Settings
+
+    assert Settings(mode="android", package="com.a", model="m").allowed_packages == ["com.a"]
+    folded = Settings(mode="android", package="com.a", allowed_packages=["com.b"], model="m")
+    assert folded.allowed_packages == ["com.a", "com.b"]
+    with pytest.raises(ValueError, match="允许的 App"):
+        Settings(mode="android", model="m")
+    with pytest.raises(ValueError, match="包名"):
+        Settings(mode="android", allowed_packages=["bad name"], model="m")
+
+
+def test_task_app_must_be_in_allow_list(tmp_path):
+    from sidecar.jobs import JobQueue, Settings
+
+    q = JobQueue(tmp_path)
+    q.configure(
+        Settings(mode="android", package="com.a", allowed_packages=["com.a", "com.b"], model="m")
+    )
+    assert q.target_package({"app": None}) == "com.a"
+    assert q.target_package({"app": "com.b"}) == "com.b"
+    with pytest.raises(ValueError, match="允许列表"):
+        q.target_package({"app": "com.evil"})
+    with pytest.raises(ValueError, match="允许列表"):
+        q.submit("任务", app="com.evil")
+
+
+def test_worker_binds_requested_app_with_allow_list(tmp_path, monkeypatch):
+    from sidecar.contracts import Task
+    from sidecar.demo import PREFIX, DemoPolicy
+    from sidecar.jobs import JobQueue, Settings
+    from sidecar.worker import run_next
+
+    seen = {}
+
+    class Device:
+        def __init__(self, *args, **kwargs):
+            seen["package"] = args[1]
+            seen["allowed"] = kwargs.get("allowed")
+
+        def launch(self):
+            pass
+
+        def observe(self):
+            raise RuntimeError("stop after construction")
+
+    class Model(DemoPolicy):
+        def plan(self, goal):
+            return Task(goal=goal, criteria=[PREFIX + "测试"])
+
+    monkeypatch.setenv("SIDECAR_MODEL", "m")
+    monkeypatch.delenv("SIDECAR_BASE_URL", raising=False)
+    monkeypatch.setattr("sidecar.android.AndroidDevice", Device)
+    monkeypatch.setattr("sidecar.worker.LangChainModel.from_env", lambda: Model())
+    q = JobQueue(tmp_path)
+    q.configure(
+        Settings(mode="android", package="com.a", allowed_packages=["com.a", "com.b"], model="m")
+    )
+    q.submit("任务", app="com.b")
+    run_next(tmp_path)
+    assert seen == {"package": "com.b", "allowed": ["com.a", "com.b"]}

@@ -6,7 +6,7 @@
 
 > 早期核心里程碑：第一版 Agent Harness 核心通过了当时的 32 项自动化测试，提供本地离线演示与可配置模型适配器。这是历史阶段记录，不表示当前新增功能已全部验收。
 
-**DeepSeek 接入已加入代码：** 推荐配置 `deepseek-flash`，使用 JSON 模式并在本地校验结构化结果；详见 [DeepSeek 配置与验证说明](docs/deepseek.md)。密钥只需在本机配置，尚未进行真实 API 调用或真实 App 验收。
+**DeepSeek 接入已加入代码：** 配置 `deepseek-flash`，使用 JSON 模式并在本地校验结构化结果；详见 [DeepSeek 配置与验证说明](docs/deepseek.md)。2026-10-12 已实际调用模型并操作 Mac 上 Android 模拟器中的 Google 时钟；具体联调结果见该文档，不代表所有 App 均已验收。
 
 ## 当前可运行的内容
 
@@ -77,7 +77,7 @@ sidecar --home .sidecar/model-demo demo --llm \
 
 `--goal` 是自然语言目标，`--item` 定义本演示的明确验收条件。一般接口使用 JSON Schema 输出；官方 DeepSeek 接口使用 JSON 模式、提示词中的输出契约及本地校验。使用截图时还需支持图像输入。不同兼容接口需要分别验证，不能仅凭 API 格式相似保证可用。
 
-模型模式会向配置的提供商发送任务、当前观察和最近的动作摘要。凭据不进入模型消息；本地 Harness 禁用继承自全局环境的 LangSmith 追踪。截图可作为内联图像接入，但当前演示仅提供文字观察。尚未进行付费模型的在线验证。
+模型模式会向配置的提供商发送任务、当前观察和最近的动作摘要。本地 Harness 禁用继承自全局环境的 LangSmith 追踪。截图可作为内联图像接入，但当前演示仅提供文字观察；Android 模式发送允许页面的截图和控件信息，识别到敏感页面时停止交接。
 
 ### 开发检查
 
@@ -105,6 +105,10 @@ sidecar --home ~/.sidecar serve
 | Base URL | `http://127.0.0.1:8765/v1` |
 | API Key | 启动时打印的配对码 |
 | 模型 | `sidecar-agent` |
+| 对话接口 | OpenAI / Chat Completions |
+| 流式输出 | 支持，可开启 |
+
+请使用「添加自定义提供商」中的 OpenAI 端点，确认界面显示的请求路径是 `/v1/chat/completions`。部分版本的内置 OpenAI 提供商默认使用 Responses 接口；Sidecar 尚未实现 `/v1/responses`，使用该接口会返回 404。
 
 在对话里发送任务描述，Sidecar 执行后在回复中返回结果。需要本人介入（登录、验证码、支付）时，回复会提示 `继续 <任务编号>`，在同一对话里回复该指令即可恢复任务。
 
@@ -120,7 +124,62 @@ SIDECAR_PAIRING_TOKEN=你的固定key sidecar --home ~/.sidecar serve
 
 或把 `SIDECAR_PAIRING_TOKEN=...` 写入 `.env` 并自行加载（项目不自动读取 `.env`，见 [.env.example](./.env.example)）。
 
-当前为**非流式**返回：一次请求同步等待任务到达终态、交接点或上述等待超时。`stream=true` 会在创建或恢复任务前返回 HTTP 400，并提示关闭流式输出。离线演示（demo 模式）秒级完成；真实 Android 任务耗时较长，请在 Cherry Studio 中关闭「流式输出」开关。
+支持**流式和非流式**返回。`stream=true` 使用 OpenAI 兼容的 SSE：先返回任务编号，再推送任务状态变化和最终验证结果；等待期间定期发送心跳，最后发送结束标记。`stream_options.include_usage=true` 会附带用量块（当前计数为 0，未统计模型消耗）。`stream=false` 保持原有的完整 JSON 回复。两种方式均最多等待 120 秒，超时后可按编号查询；关闭聊天连接不会取消后台任务，切换流式开关重试也不会重复创建任务。
+
+流式内容是任务进度与结果，不是模型的内部推理或逐 token 输出。当前 demo 模式把每条普通用户消息当作待办任务，不支持日常闲聊；回复会明确标注“离线演示模式”，完成时只表示这条文字已在本地模拟待办中验证。比如“设置晚上 9 点的闹钟”只会被记录为文字，**不会设置真实闹钟**，也不会订酒店或操作手机。请用“创建一个复习项目架构的待办”验收。
+
+### 在 Mac 的 Android 模拟器里操作真实 App
+
+启动模拟器，安装目标 App，确认 `adb devices` 显示设备在线。在当前终端配置上述模型环境变量（使用自己的 `.env` 时须显式加载），安装设备依赖后启动：
+
+```bash
+python -m pip install -e '.[android]'
+# Homebrew Android command-line tools 的常用位置；其他安装方式请用实际 SDK 路径
+export PATH="/opt/homebrew/share/android-commandlinetools/platform-tools:$PATH"
+sidecar --home ~/.sidecar/android-clock serve --android \
+  --serial emulator-5554 --package com.google.android.deskclock --port 8766
+```
+
+Cherry Studio 的 Base URL 对应为 `http://127.0.0.1:8766/v1`，模型仍为 `sidecar-agent`，API Key 使用该运行目录的配对码或固定的 `SIDECAR_PAIRING_TOKEN`。不带 `--android` 启动默认是离线演示。
+
+服务只操作「允许列表」内的 App。单 App 用 `--package`；需要多 App 时用 `--allowed-packages`（逗号分隔）指定白名单，`--package` 成为任务未指定目标时的默认项：
+
+```bash
+# 多 App：微信读书与 Microsoft To Do，默认目标是微信读书
+sidecar --home ~/.sidecar/android-work serve --android --hidden-display \
+  --serial emulator-5554 --port 8766 \
+  --allowed-packages com.tencent.weread,com.microsoft.todos \
+  --package com.tencent.weread
+```
+
+提交任务时可带 `app` 字段指定本任务的目标 App（必须是允许列表内的包名）；网页在允许多个 App 时会显示「目标 App」下拉。任务级 `app` 越界会在提交阶段被拒绝（HTTP 409）。观察到的前台 App 不在允许列表、或不是本任务目标时，一律交接给用户，不会误操作其它 App。
+
+新任务会打开该任务的目标 App；暂停恢复时保留现场并重新观察。登录、验证码、支付、转账、发送、发布等敏感页面会停止自动操作；删除入口及与其区域重叠的控件被禁止操作。带删除入口的页面仅允许读取、等待或操作明确且不重叠的独立控件，禁止坐标、滑动和返回。这些是保守的界面规则，不是对任意 App 的完整风险识别保证。加入允许列表的每个 App 仍需单独验证其界面规则。模拟器闹钟只在模拟器内生效，不会设置 iPhone 的系统闹钟。
+
+设备写入 RPC 不自动重发；结果不确定时需核对现场。界面读取允许恢复连接。更新代码或模型环境后，应先暂停或结束活动任务，再重新启动原执行进程；仅重开终端不会更新已运行的 worker。
+
+### 同一模拟器：主屏自用，Agent 使用隐藏副屏（实验性）
+
+已在本机 Android 15 模拟器验证：YouTube 留在主屏播放，Google 时钟在同一 Android 实例的虚拟副屏中运行。副屏不会打开 Mac 镜像窗口；控制台默认隐藏截图，点击“查看执行画面”才加载最近观察。这是截图预览，目前还不提供副屏的鼠标接管面板。
+
+需要 `adb`、`scrcpy`（本次验证版本 5.0.1）和 `ffmpeg` 位于 PATH，且已加载模型环境变量。Mac 可通过 `brew install scrcpy` 安装后两者。启动：
+
+```bash
+sidecar --home ~/.sidecar/android-clock serve --android --hidden-display \
+  --serial emulator-5554 --package com.google.android.deskclock --port 8766
+```
+
+所有截图、控件和触摸都绑定副屏；目标 App 来自任务的 `app` 字段或默认 `package`，且必须落在允许列表内。程序核对显示屏编号、唯一标识和 Android 本次启动标识；副屏失联时停止，不回退主屏。如果你正在主屏使用同一个目标 App，Agent 拒绝将它移走。
+
+副屏文字输入通过随包附带的 Android 桥接程序，对明确指定的可编辑控件执行 `ACTION_SET_TEXT`，替换该字段文字并读取验证。不点击抢焦点、不调用键盘或剪贴板。已用独立测试 App 验证中英文输入、主副屏同名输入框隔离及主屏同时打字；定位过期、匹配不唯一、密码框或不支持该动作时停止，不自动改用焦点输入，也不重发结果不确定的写入。自定义控件仍需逐 App 验证，支付等原有限制继续生效。桥接源码、重建方法和模拟器验收步骤见 [Android 输入桥接说明](android/textbridge/README.md)。
+
+服务结束时副屏也会销毁，其 App 界面会关闭，已保存的 App 数据保留。重启前应结束当前任务；崩溃遗留任务可在服务离线时取消，再重新启动：
+
+```bash
+sidecar --home ~/.sidecar/android-clock cancel <任务ID>
+```
+
+不能把旧副屏上的暂停任务直接恢复到新副屏；应核对已产生的结果后提交新任务，避免重复写入。主副屏仍共享账号、音频和部分系统能力，本轮没有验收 Amazon、登录/支付或任意 App 的隔离效果。
 
 ## 代码结构与设备接入
 
@@ -143,7 +202,7 @@ SIDECAR_PAIRING_TOKEN=你的固定key sidecar --home ~/.sidecar serve
 
 真实设备适配器需实现 `Device` 接口：稳定的 `device_id`，以及 `observe()`、`assess(action, observation)`、`execute(action)`。`observe()` 返回最新截图和/或界面元素；`assess()` 由可信适配器判定允许、拒绝或交接；`execute()` 执行一个有超时约束的动作。坐标点击使用 0–1 的归一化坐标，需由适配器换算。
 
-当前单执行者锁只覆盖同一工作目录；接入真实设备时还需统一设备实例的控制入口，不能用不同目录绕过互斥。设备方法必须自行实现超时，本阶段时间预算是步骤边界检查，不会强制终止任意设备调用。
+Android 执行锁按设备编号跨运行目录互斥；仍须避免其他自动化工具或人工同时操作同一设备。设备 RPC 子进程每次有 30 秒超时，界面采集失败最多重试一次，写入不重试；任务总预算在步骤边界检查。
 
 任务验收目前包含结构化逐项证据检查，不能保证模型对截图的判断一定正确；真实 App 接入后仍需增加针对目标内容的验证和跨端结果检查。SQLite 中保存的任务、动作文本及观察可能包含私人信息，应使用测试账号并按需清理运行目录。
 
