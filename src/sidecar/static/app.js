@@ -3,6 +3,7 @@ const $ = id => document.getElementById(id);
 // 配对令牌保存在当前浏览器会话中；后续 API 请求携带它完成鉴权。
 let token = sessionStorage.getItem('sidecar-token') || '';
 let current = null, config = null, imageUrl = null, busy = false;
+let showFrame = false;
 // 记住上次看到的状态，用于生成页面内提示；这里不提供系统推送。
 const seen = new Map();
 // 后端状态到中文标签的映射；排队、执行和等待交接需要分别展示。
@@ -21,10 +22,16 @@ function lines(id) { return $(id).value.split('\n').map(x=>x.trim()).filter(Bool
 // 验证配对码，读取执行模式，再显示控制台和对应的任务输入区域。
 async function connect() {
   config = await api('/config'); sessionStorage.setItem('sidecar-token',token);
+  showFrame=false;$('screen-panel').hidden=true;$('toggle-preview').textContent='查看执行画面';
+  $('toggle-preview').setAttribute('aria-expanded','false');$('frame').removeAttribute('src');
+  if(imageUrl)URL.revokeObjectURL(imageUrl);imageUrl=null;
   $('pairing').hidden=true; $('console').hidden=false; $('error').hidden=true;
   $('connection').textContent=config.worker_online?'执行端已连接':'执行端未启动';
-  $('mode-note').textContent=config.mode==='demo'?'离线演示 · 验证任务流程，不操作真实 App':'Android 执行端 · '+config.package;
+  $('mode-note').textContent=config.mode==='demo'?'离线演示 · 验证任务流程，不操作真实 App':(config.hidden_display?'隐藏执行屏 · ':'Android 执行端 · ')+config.package;
   $('demo-input').hidden=config.mode!=='demo'; $('criteria-input').hidden=config.mode==='demo';
+  const allowed=config.allowed_packages||[];
+  $('app-input').hidden=!(config.mode==='android'&&allowed.length>1);
+  $('app').replaceChildren(...allowed.map(name=>{const option=document.createElement('option');option.value=name;option.textContent=name;return option;}));
   await refresh();
 }
 // 轮询任务列表与执行端状态；busy 防止前一次刷新未结束时重复请求。
@@ -71,13 +78,25 @@ async function detail(id) {
   for(const check of job.state?.verification?.checks||[]) {
     const p=document.createElement('p');p.textContent=(check.passed?'✓ ':'○ ')+check.criterion+'：'+check.evidence;$('evidence').append(p);
   }
+  // 用户主动打开预览才获取图片；隐藏预览不影响 worker 执行。
+  $('screen-panel').hidden=!showFrame;
+  if (!showFrame) return;
   // 截图也单独鉴权；替换图片时释放旧 Blob 地址，避免持续刷新占用内存。
   const response=await fetch('/api/tasks/'+id+'/frame',{headers:{Authorization:'Bearer '+token}});
+  if (!showFrame || current!==id || !config) return;
   if(response.status===200) {
     const next=URL.createObjectURL(await response.blob());$('frame').src=next;if(imageUrl)URL.revokeObjectURL(imageUrl);imageUrl=next;
     $('frame').hidden=false;$('frame-empty').hidden=true;
   } else {$('frame').hidden=true;$('frame-empty').hidden=false;}
 }
+$('toggle-preview').onclick=async()=>{
+  showFrame=!showFrame;
+  $('toggle-preview').textContent=showFrame?'隐藏执行画面':'查看执行画面';
+  $('toggle-preview').setAttribute('aria-expanded',String(showFrame));
+  $('screen-panel').hidden=!showFrame;
+  if(!showFrame){$('frame').removeAttribute('src');if(imageUrl)URL.revokeObjectURL(imageUrl);imageUrl=null;}
+  else if(current){try{await detail(current);}catch(e){fail(e);}}
+};
 // 配对表单：阻止整页提交，连接成功后留在当前页面更新内容。
 $('pair-form').onsubmit=async event=>{event.preventDefault();token=$('token').value.trim();try{await connect();}catch(e){fail(e);}};
 // 断开只清除页面会话，不取消已经交给 worker 的任务。
@@ -86,7 +105,7 @@ $('disconnect').onclick=()=>{sessionStorage.removeItem('sidecar-token');token=''
 $('task-form').onsubmit=async event=>{
   event.preventDefault();$('submit').disabled=true;$('error').hidden=true;
   try{
-    const request={goal:$('goal').value,items:config.mode==='demo'?lines('items'):[],criteria:config.mode==='android'?lines('criteria'):[],request_id:crypto.randomUUID?crypto.randomUUID():Date.now()+'-'+Math.random()};
+    const request={goal:$('goal').value,items:config.mode==='demo'?lines('items'):[],criteria:config.mode==='android'?lines('criteria'):[],app:config.mode==='android'?($('app').value||null):null,request_id:crypto.randomUUID?crypto.randomUUID():Date.now()+'-'+Math.random()};
     const job=await api('/tasks',{method:'POST',body:JSON.stringify(request)});current=job.id;await refresh();
   }catch(e){fail(e);}finally{$('submit').disabled=false;}
 };

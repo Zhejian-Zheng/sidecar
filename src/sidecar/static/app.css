@@ -84,3 +84,6 @@ main{padding:24px 14px}
 @media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important}
 }
 
+
+/* 默认隐藏执行画面时，进度和证据使用整列。 */
+.execution-body:has(.screen[hidden]){grid-template-columns:1fr}

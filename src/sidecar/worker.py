@@ -55,7 +55,12 @@ def run_next(home):
                 or os.environ.get("SIDECAR_BASE_URL", "") != config.base_url
             ):
                 raise ValueError("模型配置已变化，请重新启动服务")
-            device = AndroidDevice(config.serial, config.package)
+            options = {"display": config.display} if config.display else {}
+            # 任务级目标 App：显式 app 优先，否则用默认 package；越界即拒绝执行。
+            target = q.target_package(request, config)
+            device = AndroidDevice(
+                config.serial, target, allowed=config.allowed_packages, **options
+            )
             model = LangChainModel.from_env()
         # 恢复时沿用已保存的任务与完成标准，不再请求模型规划。
         if saved:
@@ -74,6 +79,8 @@ def run_next(home):
                 control = q.raw(task_id)["control"]
                 if control:
                     h.store.control(task_id, control)
+                elif not saved and (launch := getattr(device, "launch", None)):
+                    launch()
 
             if saved:
                 # A resumed task's fresh control request wins before execution.

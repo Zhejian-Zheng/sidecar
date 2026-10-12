@@ -1,10 +1,15 @@
 import json
 import re
+import socket
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 
+import httpx
 import pytest
+import uvicorn
 from fastapi.testclient import TestClient
+from openai import OpenAI
 
 from sidecar import openai_compat
 from sidecar.jobs import JobQueue
@@ -39,13 +44,15 @@ def test_models_requires_auth_and_lists_agent(tmp_path):
         assert data["data"][0]["id"] == "sidecar-agent"
 
 
-def test_chat_requires_auth(tmp_path):
+@pytest.mark.parametrize("stream", [False, True])
+def test_chat_requires_auth(tmp_path, stream):
     with client(tmp_path) as c:
         response = c.post(
             "/v1/chat/completions",
-            json={"messages": [{"role": "user", "content": "你好"}]},
+            json={"messages": [{"role": "user", "content": "你好"}], "stream": stream},
         )
         assert response.status_code == 401
+    assert JobQueue(tmp_path).list() == []
 
 
 def test_chat_completion_runs_demo_task(tmp_path):
@@ -61,7 +68,7 @@ def test_chat_completion_runs_demo_task(tmp_path):
         assert data["object"] == "chat.completion"
         assert data["model"] == "sidecar-agent"
         content = data["choices"][0]["message"]["content"]
-        assert "任务已完成" in content
+        assert "离线演示已完成" in content
         assert "复习架构" in content
 
 
@@ -108,7 +115,7 @@ def test_chat_completion_resume_after_handoff(tmp_path):
         )
         assert second.status_code == 200
         content = second.json()["choices"][0]["message"]["content"]
-        assert "任务已完成" in content
+        assert "离线演示已完成" in content
 
 
 def test_extract_user_goal_prefers_last_user_text():
@@ -192,7 +199,7 @@ def test_timeout_retry_reuses_task_after_restart_and_completion(tmp_path, immedi
     with client(tmp_path) as c:
         assert chat(c).status_code == 200
         q.finish(task_id, "completed")
-        assert "任务已完成" in chat(c).json()["choices"][0]["message"]["content"]
+        assert "离线演示已完成" in chat(c).json()["choices"][0]["message"]["content"]
     assert [job["id"] for job in q.list()] == [task_id]
 
 
@@ -281,19 +288,254 @@ def test_unknown_task_command_returns_404_without_submission(tmp_path, immediate
     assert JobQueue(tmp_path).list() == []
 
 
-@pytest.mark.parametrize("resume", [False, True])
-def test_stream_rejected_before_task_submission_or_resume(tmp_path, immediate_timeout, resume):
+def stream_chunks(response):
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    frames = [line[6:] for line in response.text.splitlines() if line.startswith("data: ")]
+    assert frames[-1] == "[DONE]"
+    chunks = [json.loads(frame) for frame in frames[:-1]]
+    assert len({chunk["id"] for chunk in chunks}) == 1
+    assert len({chunk["created"] for chunk in chunks}) == 1
+    assert all(chunk["object"] == "chat.completion.chunk" for chunk in chunks)
+    assert all(chunk["model"] == "sidecar-agent" for chunk in chunks)
+    assert chunks[0]["choices"][0]["delta"]["role"] == "assistant"
+    assert chunks[-1]["choices"][0]["finish_reason"] == "stop"
+    return chunks
+
+
+def stream_text(chunks):
+    return "".join(chunk["choices"][0]["delta"].get("content", "") for chunk in chunks)
+
+
+def test_stream_runs_demo_and_returns_result(tmp_path):
+    start_demo_worker(tmp_path)
+    with client(tmp_path) as c:
+        chunks = stream_chunks(chat(c, "创建流式演示待办", stream=True))
+    text = stream_text(chunks)
+    assert "离线演示已完成" in text and "流式演示待办" in text
+    task_id = JobQueue(tmp_path).list()[0]["id"]
+    assert task_id in text
+    assert all(chunk["task_id"] == task_id for chunk in chunks)
+
+
+@pytest.mark.parametrize("status", ["queued", "paused", "waiting_user", "failed", "cancelled"])
+def test_stream_query_returns_current_status_without_side_effects(tmp_path, status):
     q = JobQueue(tmp_path)
-    goal = "创建待办"
-    if resume:
-        task_id = q.submit("原任务", items=["原任务"])["id"]
-        q.control(task_id, "pause")
-        goal = f"继续 {task_id}"
+    task_id = q.submit("原任务", items=["原任务"])["id"]
+    q.finish(task_id, status, "状态说明")
     before = q.list()
     with client(tmp_path) as c:
-        response = chat(c, goal, stream=True)
-    assert response.status_code == 400
-    error = response.json()["error"]
-    assert error["param"] == "stream"
-    assert "关闭" in error["message"]
+        chunks = stream_chunks(chat(c, f"查询 {task_id}", stream=True))
+    assert format_result(before[0], mode="demo") in stream_text(chunks)
     assert q.list() == before
+
+
+def test_stream_resume_and_handoff(tmp_path):
+    q = JobQueue(tmp_path)
+    task_id = q.submit("原任务", items=["原任务"])["id"]
+    q.control(task_id, "pause")
+    q.engine.mkdir()
+    (q.engine / "demo-device.json").write_text(
+        json.dumps({"logged_in": False, "screen": "list", "draft": "", "items": []})
+    )
+    start_demo_worker(tmp_path)
+    with client(tmp_path) as c:
+        chunks = stream_chunks(chat(c, f"继续 {task_id}", stream=True))
+    assert f"继续 {task_id}" in stream_text(chunks)
+    assert q.get(task_id)["status"] == "waiting_user"
+    assert len(q.list()) == 1
+
+
+def test_stream_timeout_heartbeat_and_retry_without_duplicate(tmp_path, monkeypatch):
+    monkeypatch.setattr(openai_compat, "COMPLETION_TIMEOUT", 0.1, raising=False)
+    monkeypatch.setattr(openai_compat, "HEARTBEAT_INTERVAL", 0.01, raising=False)
+    with client(tmp_path) as c:
+        response = chat(c, stream=True)
+        chunks = stream_chunks(response)
+        task_id = JobQueue(tmp_path).list()[0]["id"]
+        assert f"查询 {task_id}" in stream_text(chunks)
+        assert ": keep-alive" in response.text
+        # stream_options 和 stream 不应改变同一次任务的去重身份。
+        retry = chat(c, stream=False, stream_options={"include_usage": True})
+        assert retry.json()["task_id"] == task_id
+    assert len(JobQueue(tmp_path).list()) == 1
+
+
+def test_openai_sdk_consumes_stream_and_optional_usage(tmp_path):
+    start_demo_worker(tmp_path)
+    with client(tmp_path) as c:
+        sdk = OpenAI(api_key="test-pairing-secret", base_url="http://testserver/v1", http_client=c)
+        chunks = list(
+            sdk.chat.completions.create(
+                model="sidecar-agent",
+                messages=[{"role": "user", "content": "SDK 流式待办"}],
+                stream=True,
+                stream_options={"include_usage": True},
+            )
+        )
+    assert "离线演示已完成" in "".join(
+        chunk.choices[0].delta.content or "" for chunk in chunks if chunk.choices
+    )
+    assert chunks[-2].choices[0].finish_reason == "stop"
+    assert chunks[-1].choices == []
+    assert chunks[-1].usage.total_tokens == 0
+
+
+@pytest.mark.parametrize("goal,expected", [("", 400), (f"查询 {'0' * 32}", 404)])
+def test_stream_validation_happens_before_sse_headers(tmp_path, goal, expected):
+    with client(tmp_path) as c:
+        response = chat(c, goal, stream=True)
+    assert response.status_code == expected
+    assert response.headers["content-type"].startswith("application/json")
+    assert JobQueue(tmp_path).list() == []
+
+
+@pytest.fixture
+def live_client(tmp_path):
+    from sidecar.server import create_app
+
+    # 真正的 socket 验证首段即时到达；TestClient 会缓冲整个响应，不能证明这一点。
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        server = uvicorn.Server(
+            uvicorn.Config(create_app(tmp_path, token="test-pairing-secret"), log_level="error")
+        )
+        thread = threading.Thread(target=server.run, kwargs={"sockets": [sock]}, daemon=True)
+        thread.start()
+        try:
+            deadline = time.monotonic() + 5
+            while not server.started and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert server.started
+            with httpx.Client(
+                base_url=f"http://127.0.0.1:{sock.getsockname()[1]}",
+                headers=auth(),
+                timeout=3,
+                trust_env=False,
+            ) as c:
+                yield c
+        finally:
+            server.should_exit = True
+            thread.join(timeout=5)
+            assert not thread.is_alive()
+
+
+def test_live_stream_delivers_task_id_before_work_and_disconnect_preserves_task(
+    tmp_path, live_client
+):
+    from sidecar.worker import run_next
+
+    body = {
+        "model": "sidecar-agent",
+        "messages": [{"role": "user", "content": "连接测试"}],
+        "stream": True,
+    }
+    with live_client.stream("POST", "/v1/chat/completions", json=body) as response:
+        assert response.status_code == 200
+        for line in response.iter_lines():
+            if line.startswith("data: "):
+                first = json.loads(line[6:])
+                break
+        task_id = first["task_id"]
+        assert task_id in first["choices"][0]["delta"]["content"]
+        assert JobQueue(tmp_path).get(task_id)["status"] == "queued"
+    assert JobQueue(tmp_path).get(task_id)["status"] == "queued"
+    assert run_next(tmp_path)
+    # 客户端关闭响应后，worker 仍能完成；重试流式请求仍返回同一任务。
+    response = live_client.post("/v1/chat/completions", json=body)
+    assert "离线演示已完成" in stream_text(stream_chunks(response))
+    assert [job["id"] for job in JobQueue(tmp_path).list()] == [task_id]
+
+
+def test_live_stream_pushes_status_change_then_completion(tmp_path, live_client):
+    q = JobQueue(tmp_path)
+    with live_client.stream(
+        "POST",
+        "/v1/chat/completions",
+        json={
+            "messages": [{"role": "user", "content": "进度测试"}],
+            "stream": True,
+        },
+    ) as response:
+        assert response.status_code == 200
+        lines = response.iter_lines()
+        chunks = (json.loads(line[6:]) for line in lines if line.startswith("data: "))
+        first = next(chunks)
+        task_id = first["task_id"]
+        q.finish(task_id, "executing")
+        for chunk in chunks:
+            if "正在执行" in chunk["choices"][0]["delta"].get("content", ""):
+                break
+        else:
+            pytest.fail("没有在任务执行期间收到状态更新")
+        q.finish(task_id, "completed")
+        remaining = list(lines)
+        assert any("离线演示已完成" in line for line in remaining)
+        assert "data: [DONE]" in remaining
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_demo_alarm_request_is_labeled_as_simulation_without_history_leak(tmp_path, stream):
+    q = JobQueue(tmp_path)
+    q.engine.mkdir()
+    (q.engine / "demo-device.json").write_text(
+        json.dumps(
+            {
+                "logged_in": True,
+                "screen": "list",
+                "draft": "",
+                "items": ["先前的私人待办"],
+            }
+        )
+    )
+    start_demo_worker(tmp_path)
+    with client(tmp_path) as c:
+        response = chat(c, "帮我设置晚上9点的闹钟", stream=stream)
+    text = (
+        stream_text(stream_chunks(response))
+        if stream
+        else response.json()["choices"][0]["message"]["content"]
+    )
+    assert "离线演示已完成" in text
+    assert "不会操作手机或真实 App" in text
+    assert "任务已完成" not in text
+    assert "先前的私人待办" not in text
+    assert "帮我设置晚上9点的闹钟" in text
+    assert text.count("任务编号：") == 1
+
+
+def test_historical_demo_result_keeps_label_after_switching_to_android(tmp_path):
+    from sidecar.jobs import Settings
+    from sidecar.worker import run_next
+
+    q = JobQueue(tmp_path)
+    job = q.submit("历史演示", items=["历史演示"])
+    run_next(tmp_path)
+    q.configure(Settings(mode="android", package="test.clock", model="test-model"))
+    with client(tmp_path) as c:
+        response = chat(c, f"查询 {job['id']}")
+    text = response.json()["choices"][0]["message"]["content"]
+    assert "离线演示已完成" in text
+    assert "不会操作手机或真实 App" in text
+
+
+def test_android_result_is_not_presented_as_demo():
+    job = {
+        "id": "android-test",
+        "status": "completed",
+        "state": {
+            "device_id": "android:test-clock",
+            "verification": {
+                "checks": [
+                    {
+                        "criterion": "21:00 闹钟存在",
+                        "passed": True,
+                        "evidence": "时钟页面显示 21:00",
+                    },
+                ]
+            },
+        },
+    }
+    text = format_result(job)
+    assert "任务已完成" in text and "时钟页面显示 21:00" in text
+    assert "离线演示" not in text

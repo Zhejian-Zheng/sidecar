@@ -4,6 +4,7 @@
 import argparse
 import json
 import os
+from contextlib import nullcontext
 from pathlib import Path
 from uuid import uuid4
 
@@ -44,8 +45,18 @@ def parser():
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8765)
     serve.add_argument("--android", action="store_true")
+    serve.add_argument(
+        "--hidden-display",
+        action="store_true",
+        help="Use a hidden secondary Android display (experimental)",
+    )
     serve.add_argument("--serial", default="emulator-5554")
-    serve.add_argument("--package", default="")
+    serve.add_argument("--package", default="", help="Default target app when a task omits one")
+    serve.add_argument(
+        "--allowed-packages",
+        default="",
+        help="Comma-separated allow-list of app packages, e.g. com.a,com.b (multi-app tasks)",
+    )
     worker = commands.add_parser("worker", help="Run the queue worker independently")
     worker.add_argument("--once", action="store_true")
     return root
@@ -56,6 +67,36 @@ def main():
     args = parser().parse_args()
     try:
         home = args.home.resolve()
+        # 队列服务退出后仍能取消遗留任务，避免新副屏因未结束任务无法启动。
+        if (home / "queue.sqlite").exists() and args.command in {
+            "pause",
+            "cancel",
+            "status",
+            "events",
+            "resume",
+        }:
+            from sidecar.jobs import JobQueue
+            from sidecar.server import worker_alive
+            from sidecar.worker import recover
+
+            queue = JobQueue(home)
+            try:
+                queue.raw(args.task_id)
+            except KeyError:
+                pass  # 同目录中的旧 CLI 演示任务仍交给原入口处理。
+            else:
+                if args.command in {"pause", "cancel", "resume"} and not worker_alive(home):
+                    recover(home)
+                if args.command in {"pause", "cancel"}:
+                    result = queue.control(args.task_id, args.command)
+                elif args.command == "resume":
+                    result = queue.resume(args.task_id, args.note)
+                elif args.command == "events":
+                    result = queue.events(args.task_id)
+                else:
+                    result = queue.get(args.task_id)
+                emit(result)
+                return
         # 只读设备检查：在本地保存截图，不调用模型或执行点击。
         if args.command == "observe":
             import base64
@@ -87,23 +128,37 @@ def main():
         if args.command == "serve":
             import uvicorn
 
+            from sidecar.displays import hidden_display
             from sidecar.jobs import JobQueue, Settings
             from sidecar.server import create_app, pairing_token, start_worker
 
+            allowed = [name.strip() for name in args.allowed_packages.split(",") if name.strip()]
             config = Settings(
                 mode="android" if args.android else "demo",
                 serial=args.serial,
-                package=args.package,
+                package=args.package or (allowed[0] if allowed else ""),
+                allowed_packages=allowed,
                 model=os.environ.get("SIDECAR_MODEL", ""),
                 base_url=os.environ.get("SIDECAR_BASE_URL", ""),
             )
             if args.android and not os.environ.get("SIDECAR_API_KEY"):
                 raise ValueError("Android 模式需要显式配置 SIDECAR_API_KEY")
-            JobQueue(home).configure(config)
-            token = pairing_token(home)
-            start_worker(home)
-            print(f"Sidecar: http://{args.host}:{args.port}\n配对码: {token}", flush=True)
-            uvicorn.run(create_app(home, token), host=args.host, port=args.port, access_log=False)
+            if args.hidden_display and not args.android:
+                raise ValueError("--hidden-display 需要 --android")
+            if args.hidden_display and any(
+                j["status"] not in {"completed", "failed", "cancelled"}
+                for j in JobQueue(home).list()
+            ):
+                raise ValueError("创建新的隐藏执行屏前，请先结束当前任务")
+            with hidden_display(args.serial) if args.hidden_display else nullcontext() as display:
+                config.display = display
+                JobQueue(home).configure(config)
+                token = pairing_token(home)
+                start_worker(home)
+                print(f"Sidecar: http://{args.host}:{args.port}\n配对码: {token}", flush=True)
+                uvicorn.run(
+                    create_app(home, token), host=args.host, port=args.port, access_log=False
+                )
             return
         # 下面的命令使用离线模拟设备；真实手机任务通过网页队列进入 worker。
         device = DemoDevice(home)

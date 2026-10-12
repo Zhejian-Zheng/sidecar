@@ -9,16 +9,51 @@ import time
 from contextlib import redirect_stdout
 
 
+def connect_device(serial):
+    import uiautomator2 as u2
+    from uiautomator2 import core
+
+    device = u2.connect(serial)
+    recoverable_call = device.jsonrpc_call
+
+    # 底层默认会重启服务并重发失败 RPC。写操作结果不确定时必须交接，不能重发。
+    # 仅覆盖这个子进程中的设备实例；依赖内部单次调用，库不兼容时直接失败。
+    def call_once(method, params=None, timeout=10):
+        if method in {"dumpWindowHierarchy", "takeScreenshot", "deviceInfo"}:
+            return recoverable_call(method, params, timeout)
+        return core._jsonrpc_call(
+            device._dev, device._device_server_port, method, params, timeout, False
+        )
+
+    device.jsonrpc_call = call_once
+    return device
+
+
+def launch_app(device, package):
+    resolved = device.shell(["cmd", "package", "resolve-activity", "--brief", package])
+    components = [line.strip() for line in resolved.output.splitlines() if "/" in line]
+    if resolved.exit_code or not components or not components[-1].startswith(package + "/"):
+        raise RuntimeError("Cannot resolve the configured app launcher")
+    activity = components[-1].split("/", 1)[1]
+    device.app_start(package, activity=activity, wait=False, stop=False)
+    if not device.app_wait(package, timeout=5, front=True):
+        raise RuntimeError("Configured app did not reach the foreground")
+
+
 # 连接指定 Android；读取截图和控件，或把单步动作转换为自动化工具调用。
 def main():
     request = json.load(sys.stdin)
+    if request.get("display") is not None:
+        print(json.dumps(display_request(request)))
+        return
     with redirect_stdout(sys.stderr):
-        import uiautomator2 as u2
-
-        d = u2.connect(request["serial"])
+        d = connect_device(request["serial"])
         d.settings["wait_timeout"] = 5
         # 观察包含当前 App、完整控件树和缩小后的截图，供主进程解析。
-        if request["op"] == "observe":
+        if request["op"] == "launch":
+            launch_app(d, request["payload"]["package"])
+            response = {}
+        elif request["op"] == "observe":
             current = d.app_current()
             xml = d.dump_hierarchy()
             image = d.screenshot()
@@ -60,6 +95,46 @@ def main():
         else:
             raise ValueError("Unsupported operation")
     print(json.dumps(response))
+
+
+def display_request(request):
+    from sidecar import displays
+
+    serial = request["serial"]
+    binding = displays.DisplayBinding.model_validate(request["display"])
+    with redirect_stdout(sys.stderr):
+        if request["op"] == "launch":
+            if request["package"] != request["payload"]["package"]:
+                raise ValueError("Configured package mismatch")
+            displays.launch(serial, binding, request["package"])
+        elif request["op"] == "observe":
+            device = connect_device(serial)
+            try:
+                package, activity, xml, image = displays.observe(serial, binding, device)
+            finally:
+                # Release our automation connection before the next node-write bridge starts.
+                device.stop_uiautomator()
+            image.thumbnail((960, 1600))
+            out = io.BytesIO()
+            image.save(out, format="PNG")
+            return dict(
+                package=package,
+                activity=activity,
+                xml=xml,
+                image=base64.b64encode(out.getvalue()).decode(),
+                display=binding.model_dump(),
+            )
+        elif request["op"] == "execute":
+            displays.verify(serial, binding)
+            if displays.current(serial, binding.id)[0] != request["package"]:
+                raise RuntimeError("Target app left hidden display; refusing input")
+            if request["payload"]["kind"] == "type":
+                displays.set_text(serial, binding, request["package"], request["payload"])
+            else:
+                displays.execute(serial, binding, request["payload"])
+        else:
+            raise ValueError("Unsupported display operation")
+    return {}
 
 
 if __name__ == "__main__":

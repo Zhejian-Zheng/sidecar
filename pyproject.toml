@@ -19,7 +19,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8,<10", "ruff>=0.9,<1", "httpx>=0.28,<1"]
-android = ["uiautomator2>=3.2,<4"]
+android = ["uiautomator2>=3.2,<4", "pillow>=10,<13"]
 
 [project.scripts]
 sidecar = "sidecar.cli:main"
