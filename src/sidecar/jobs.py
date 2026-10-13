@@ -12,9 +12,9 @@ from uuid import uuid4
 from pydantic import Field, model_validator
 
 from sidecar.contracts import Message, Task
-from sidecar.demo import PREFIX, DemoDevice, DemoPolicy
 from sidecar.displays import DisplayBinding
 from sidecar.harness import TERMINAL, Harness
+from sidecar.offline import PREFIX, OfflineDevice, OfflinePolicy
 from sidecar.store import Store
 
 
@@ -254,7 +254,7 @@ class JobQueue:
                     ("cancelled" if signal == "cancel" else "paused", task_id),
                 )
         if self.state(task_id):
-            with Harness(self.engine, DemoDevice(self.engine), DemoPolicy()) as harness:
+            with Harness(self.engine, OfflineDevice(self.engine), OfflinePolicy()) as harness:
                 try:
                     harness.control(task_id, signal)
                 except ValueError:

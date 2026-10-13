@@ -22,7 +22,7 @@ def test_offline_demo_runs_and_persists_result(tmp_path):
     assert result["mode"] == "offline_demo"
     saved = run_cli(tmp_path, "status", result["task_id"])
     assert json.loads(saved.stdout)["status"] == "completed"
-    assert json.loads((tmp_path / "demo-device.json").read_text())["items"] == ["复习架构"]
+    assert json.loads((tmp_path / "offline-device.json").read_text())["items"] == ["复习架构"]
 
 
 def test_demo_handoff_can_resume_in_another_process(tmp_path):
@@ -45,10 +45,10 @@ def test_unknown_task_returns_readable_error(tmp_path):
 def test_new_demo_cannot_change_device_while_old_task_waits(tmp_path):
     first = json.loads(run_cli(tmp_path, "demo", "--require-login").stdout)
     assert run_cli(tmp_path, "demo-login").returncode == 0
-    device_before = (tmp_path / "demo-device.json").read_text()
+    device_before = (tmp_path / "offline-device.json").read_text()
     attempted = run_cli(tmp_path, "demo", "--require-login")
     assert attempted.returncode != 0
-    assert (tmp_path / "demo-device.json").read_text() == device_before
+    assert (tmp_path / "offline-device.json").read_text() == device_before
     assert (
         json.loads(run_cli(tmp_path, "resume", first["task_id"], "--note", "已处理").stdout)[
             "status"

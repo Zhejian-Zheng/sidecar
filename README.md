@@ -208,7 +208,7 @@ sidecar --home ~/.sidecar/android-clock cancel <任务ID>
 | `src/sidecar/model.py` | LangChain 结构化输出与受限上下文 |
 | `src/sidecar/android.py` | Android 设备适配（uiautomator2） |
 | `src/sidecar/android_rpc.py` | Android 一次性 RPC 子进程传输 |
-| `src/sidecar/demo.py` | 明确标注的离线模拟设备与规则策略 |
+| `src/sidecar/offline.py` | 明确标注的离线模拟设备与规则策略 |
 | `src/sidecar/cli.py` | 运行、查看、交接、暂停、取消与 `serve` 入口 |
 | `src/sidecar/static/` | 手机控制台前端 |
 | `tests/` | 核心行为、模型边界、队列、服务与 OpenAI 端点测试 |

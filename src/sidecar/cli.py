@@ -9,9 +9,9 @@ from pathlib import Path
 from uuid import uuid4
 
 from sidecar.contracts import Task
-from sidecar.demo import PREFIX, DemoDevice, DemoPolicy
 from sidecar.harness import Harness
 from sidecar.model import LangChainModel
+from sidecar.offline import PREFIX, OfflineDevice, OfflinePolicy
 
 
 # 以可读 JSON 输出结果，保留中文，方便终端查看及其他程序解析。
@@ -175,9 +175,9 @@ def main():
                 )
             return
         # 下面的命令使用离线模拟设备；真实手机任务通过网页队列进入 worker。
-        device = DemoDevice(home)
+        device = OfflineDevice(home)
         if args.command in {"status", "events", "pause", "cancel", "demo-login"}:
-            with Harness(home, device, DemoPolicy()) as agent:
+            with Harness(home, device, OfflinePolicy()) as agent:
                 if args.command == "status":
                     emit(agent.status(args.task_id))
                 elif args.command == "events":
@@ -221,7 +221,7 @@ def main():
             ):
                 raise ValueError("resume requires the original model and endpoint configuration")
 
-        model = LangChainModel.from_env() if metadata["mode"] == "llm_demo" else DemoPolicy()
+        model = LangChainModel.from_env() if metadata["mode"] == "llm_demo" else OfflinePolicy()
 
         # 在任务获准启动后保存演示元信息，必要时模拟等待用户登录。
         def prepare_demo():

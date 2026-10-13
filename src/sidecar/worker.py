@@ -8,10 +8,10 @@ import time
 from pathlib import Path
 
 from sidecar.contracts import Task
-from sidecar.demo import PREFIX, DemoDevice, DemoPolicy
 from sidecar.harness import TERMINAL, Harness
 from sidecar.jobs import JobQueue
 from sidecar.model import LangChainModel
+from sidecar.offline import PREFIX, OfflineDevice, OfflinePolicy
 from sidecar.store import Store
 
 
@@ -27,7 +27,7 @@ def recover(home):
         elif row["control"] == "cancel":
             q.control(row["id"], "cancel")
             if state:
-                with Harness(q.engine, DemoDevice(q.engine), DemoPolicy()) as h:
+                with Harness(q.engine, OfflineDevice(q.engine), OfflinePolicy()) as h:
                     h.control(row["id"], "cancel")
             q.finish(row["id"], "cancelled", "已取消中断任务")
         else:
@@ -46,7 +46,7 @@ def run_next(home):
         request = json.loads(job["body"])
         saved = q.state(task_id)
         if config.mode == "demo":
-            device, model = DemoDevice(q.engine), DemoPolicy()
+            device, model = OfflineDevice(q.engine), OfflinePolicy()
         else:
             from sidecar.android import AndroidDevice
 

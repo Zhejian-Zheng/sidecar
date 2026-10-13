@@ -38,7 +38,7 @@ Interfaces: `Task(goal, criteria)`, `Observation`, `Action`, `Verification`; `De
 
 ## Task 2: Model adapter and runnable demo
 
-Files: `src/sidecar/model.py`, `demo.py`, `cli.py`, `tests/test_model.py`, `tests/test_cli.py`.
+Files: `src/sidecar/model.py`, `offline.py`, `cli.py`, `tests/test_model.py`, `tests/test_cli.py`.
 
 - [x] 编写上下文限制、结构化输出和 CLI 测试。
 - [x] 实现可配置模型适配；凭据只从显式配置读取。

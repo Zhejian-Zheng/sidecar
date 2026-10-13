@@ -73,11 +73,11 @@ def test_idempotency_key_cannot_silently_change_task(tmp_path):
 
 def test_resume_preserves_original_plan(tmp_path, monkeypatch):
     from sidecar.contracts import Task
-    from sidecar.demo import PREFIX, DemoDevice, DemoPolicy
     from sidecar.jobs import JobQueue, Settings
+    from sidecar.offline import PREFIX, OfflineDevice, OfflinePolicy
     from sidecar.worker import run_next
 
-    class Model(DemoPolicy):
+    class Model(OfflinePolicy):
         plans = 0
 
         def plan(self, goal):
@@ -85,7 +85,7 @@ def test_resume_preserves_original_plan(tmp_path, monkeypatch):
             return Task(goal=goal, criteria=[PREFIX + "原始任务"])
 
     model = Model()
-    device = DemoDevice(tmp_path / "engine")
+    device = OfflineDevice(tmp_path / "engine")
     state = device.load()
     state["logged_in"] = False
     device.save(state)
@@ -154,14 +154,14 @@ def test_queue_terminal_result_rejects_cancel_and_late_finish(tmp_path):
 @pytest.mark.parametrize("after_restart", [False, True])
 def test_cancel_between_engine_completion_and_queue_finish(tmp_path, after_restart):
     from sidecar.contracts import Task
-    from sidecar.demo import PREFIX, DemoDevice, DemoPolicy
     from sidecar.harness import Harness
+    from sidecar.offline import PREFIX, OfflineDevice, OfflinePolicy
     from sidecar.worker import recover
 
     q = setup(tmp_path)
     task_id = q.submit("任务", ["一"])["id"]
     q.claim()
-    with Harness(q.engine, DemoDevice(q.engine), DemoPolicy()) as h:
+    with Harness(q.engine, OfflineDevice(q.engine), OfflinePolicy()) as h:
         result = h.start(Task(goal="任务", criteria=[PREFIX + "一"]), task_id=task_id)
     assert result["status"] == "completed"
     q.control(task_id, "cancel")
@@ -207,11 +207,11 @@ def test_cancel_and_finish_from_concurrent_connections(tmp_path):
 @pytest.mark.parametrize("cancel", [False, True])
 def test_new_android_task_launches_app_unless_cancelled(tmp_path, monkeypatch, cancel):
     from sidecar.contracts import Task
-    from sidecar.demo import PREFIX, DemoDevice, DemoPolicy
     from sidecar.jobs import JobQueue, Settings
+    from sidecar.offline import PREFIX, OfflineDevice, OfflinePolicy
     from sidecar.worker import run_next
 
-    class Device(DemoDevice):
+    class Device(OfflineDevice):
         launched = False
 
         def launch(self):
@@ -221,7 +221,7 @@ def test_new_android_task_launches_app_unless_cancelled(tmp_path, monkeypatch, c
             assert self.launched
             return super().observe()
 
-    class Model(DemoPolicy):
+    class Model(OfflinePolicy):
         def plan(self, goal):
             if cancel:
                 q.control(job["id"], "cancel")
@@ -269,8 +269,8 @@ def test_task_app_must_be_in_allow_list(tmp_path):
 
 def test_worker_binds_requested_app_with_allow_list(tmp_path, monkeypatch):
     from sidecar.contracts import Task
-    from sidecar.demo import PREFIX, DemoPolicy
     from sidecar.jobs import JobQueue, Settings
+    from sidecar.offline import PREFIX, OfflinePolicy
     from sidecar.worker import run_next
 
     seen = {}
@@ -286,7 +286,7 @@ def test_worker_binds_requested_app_with_allow_list(tmp_path, monkeypatch):
         def observe(self):
             raise RuntimeError("stop after construction")
 
-    class Model(DemoPolicy):
+    class Model(OfflinePolicy):
         def plan(self, goal):
             return Task(goal=goal, criteria=[PREFIX + "测试"])
 
@@ -308,12 +308,12 @@ def test_worker_binds_requested_app_with_allow_list(tmp_path, monkeypatch):
 def test_worker_closes_finished_hidden_app_but_keeps_handoff(
     tmp_path, monkeypatch, handoff, cleanup_failure
 ):
-    from sidecar.demo import PREFIX, DemoDevice, DemoPolicy
     from sidecar.displays import DisplayBinding
     from sidecar.jobs import JobQueue, Settings
+    from sidecar.offline import PREFIX, OfflineDevice, OfflinePolicy
     from sidecar.worker import run_next
 
-    class Device(DemoDevice):
+    class Device(OfflineDevice):
         closed = False
 
         def launch(self):
@@ -336,7 +336,7 @@ def test_worker_closes_finished_hidden_app_but_keeps_handoff(
     monkeypatch.setenv("SIDECAR_MODEL", "test")
     monkeypatch.delenv("SIDECAR_BASE_URL", raising=False)
     monkeypatch.setattr("sidecar.android.AndroidDevice", lambda *a, **kw: device)
-    monkeypatch.setattr("sidecar.worker.LangChainModel.from_env", lambda: DemoPolicy())
+    monkeypatch.setattr("sidecar.worker.LangChainModel.from_env", lambda: OfflinePolicy())
     q = JobQueue(tmp_path)
     q.configure(
         Settings(

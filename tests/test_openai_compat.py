@@ -75,7 +75,7 @@ def test_chat_completion_runs_demo_task(tmp_path):
 def test_chat_completion_handoff_returns_resume_hint(tmp_path):
     engine = tmp_path / "engine"
     engine.mkdir(parents=True, exist_ok=True)
-    (engine / "demo-device.json").write_text(
+    (engine / "offline-device.json").write_text(
         json.dumps({"logged_in": False, "screen": "list", "draft": "", "items": []})
     )
     start_demo_worker(tmp_path)
@@ -94,7 +94,7 @@ def test_chat_completion_handoff_returns_resume_hint(tmp_path):
 def test_chat_completion_resume_after_handoff(tmp_path):
     engine = tmp_path / "engine"
     engine.mkdir(parents=True, exist_ok=True)
-    device = engine / "demo-device.json"
+    device = engine / "offline-device.json"
     device.write_text(json.dumps({"logged_in": False, "screen": "list", "draft": "", "items": []}))
     start_demo_worker(tmp_path)
     with client(tmp_path) as c:
@@ -335,7 +335,7 @@ def test_stream_resume_and_handoff(tmp_path):
     task_id = q.submit("原任务", items=["原任务"])["id"]
     q.control(task_id, "pause")
     q.engine.mkdir()
-    (q.engine / "demo-device.json").write_text(
+    (q.engine / "offline-device.json").write_text(
         json.dumps({"logged_in": False, "screen": "list", "draft": "", "items": []})
     )
     start_demo_worker(tmp_path)
@@ -478,7 +478,7 @@ def test_live_stream_pushes_status_change_then_completion(tmp_path, live_client)
 def test_demo_alarm_request_is_labeled_as_simulation_without_history_leak(tmp_path, stream):
     q = JobQueue(tmp_path)
     q.engine.mkdir()
-    (q.engine / "demo-device.json").write_text(
+    (q.engine / "offline-device.json").write_text(
         json.dumps(
             {
                 "logged_in": True,

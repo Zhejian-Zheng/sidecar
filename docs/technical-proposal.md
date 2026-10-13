@@ -484,7 +484,7 @@ flowchart LR
     tasks.sqlite                # 任务状态、控制、事件和动作日志
     checkpoints.sqlite          # LangGraph 检查点
     execution.lock              # 同一工作区的 Harness 执行锁
-    demo-device.json             # 只有离线模式使用的模拟 App 状态
+    offline-device.json          # 只有离线模式使用的模拟 App 状态
 ```
 
 SQLite 在 WAL 模式下还可能生成 `-wal`、`-shm` 配套文件。直接 CLI 演示把对应数据库和模拟文件放在 `<home>` 下，并用 `runs/<task_id>.json` 保存演示模型配置。独立 `observe` 命令可以另存一张本地图片，默认文件名为 `android-screen.png`。

@@ -10,10 +10,10 @@ PREFIX = "待办存在："
 
 
 # 用本地 JSON 模拟清单页、编辑页和登录状态，实现统一设备接口。
-class DemoDevice:
+class OfflineDevice:
     # 用数据文件的绝对路径区分演示设备，避免跨目录误恢复。
     def __init__(self, home: Path):
-        self.path = Path(home) / "demo-device.json"
+        self.path = Path(home) / "offline-device.json"
         self.device_id = "offline-demo:" + str(self.path.resolve())
 
     # 读取模拟状态；首次运行从已登录的空清单开始。
@@ -74,12 +74,12 @@ class DemoDevice:
         elif action.kind == "back":
             state.update(screen="list", draft="")
         elif action.kind != "wait":
-            raise ValueError("Unsupported demo action")
+            raise ValueError("Unsupported offline action")
         self.save(state)
 
 
 # 用于测试的确定性策略，不具备理解任意自然语言的能力。
-class DemoPolicy:
+class OfflinePolicy:
     """Rule-based test policy; does not understand arbitrary natural language."""
 
     # 从演示观察中还原模拟状态，供规则决策和验证使用。
