@@ -107,6 +107,8 @@ def display_request(request):
             if request["package"] != request["payload"]["package"]:
                 raise ValueError("Configured package mismatch")
             displays.launch(serial, binding, request["package"])
+        elif request["op"] == "close_app":
+            displays.close_app(serial, binding, request["package"])
         elif request["op"] == "observe":
             device = connect_device(serial)
             try:

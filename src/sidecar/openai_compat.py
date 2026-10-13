@@ -63,7 +63,16 @@ def extract_user_goal(messages):
 def submit_goal(q: JobQueue, goal: str, request_id: str):
     if q.settings().mode == "demo":
         return q.submit(goal=goal, items=[goal], request_id=request_id)
-    return q.submit(goal=goal, request_id=request_id)
+    from sidecar.apps import route_app
+
+    # A transport retry must return the original task even after configuration changes.
+    with q.db() as db:
+        old = db.execute("SELECT id,body FROM jobs WHERE request_id=?", (request_id,)).fetchone()
+    if old:
+        if json.loads(old["body"])["goal"] != goal:
+            raise ValueError("同一个提交编号不能用于不同任务")
+        return q.get(old["id"])
+    return q.submit(goal=goal, app=route_app(goal, q.settings()), request_id=request_id)
 
 
 # 在发送响应头前完成校验、去重和入队，确保错误仍可返回正常 HTTP 状态码。
@@ -127,6 +136,8 @@ def format_result(job, *, mode=None, include_heading=True):
         for check in checks:
             mark = "✓" if check.get("passed") else "✗"
             lines.append(f"- {check.get('criterion', '')}：{check.get('evidence', '')}（{mark}）")
+        if "副屏应用未能退出" in reason:
+            lines.append("⚠️ 副屏应用未能退出，请核对执行画面。")
         return heading + "\n".join(lines)
     if status in HANDOFF:
         return heading + f"⚠️ 需要你介入：{reason}\n处理完成后，请回复：继续 {job['id']}"

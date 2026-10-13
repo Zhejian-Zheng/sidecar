@@ -53,12 +53,8 @@ def test_config_exposes_allow_list_and_task_app_is_validated(tmp_path):
         assert data["allowed_packages"] == ["com.a", "com.b"]
         assert data["package"] == "com.a"
         # 目标 App 越界时，提交阶段返回可解释的 409，而不是排队后失败。
-        rejected = c.post(
-            "/api/tasks", headers=headers, json={"goal": "任务", "app": "com.evil"}
-        )
+        rejected = c.post("/api/tasks", headers=headers, json={"goal": "任务", "app": "com.evil"})
         assert rejected.status_code == 409
-        accepted = c.post(
-            "/api/tasks", headers=headers, json={"goal": "任务", "app": "com.b"}
-        )
+        accepted = c.post("/api/tasks", headers=headers, json={"goal": "任务", "app": "com.b"})
         assert accepted.status_code == 201
         assert accepted.json()["request"]["app"] == "com.b"

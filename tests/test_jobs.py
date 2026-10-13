@@ -301,3 +301,55 @@ def test_worker_binds_requested_app_with_allow_list(tmp_path, monkeypatch):
     q.submit("任务", app="com.b")
     run_next(tmp_path)
     assert seen == {"package": "com.b", "allowed": ["com.a", "com.b"]}
+
+
+@pytest.mark.parametrize("handoff", [False, True])
+@pytest.mark.parametrize("cleanup_failure", [False, True])
+def test_worker_closes_finished_hidden_app_but_keeps_handoff(
+    tmp_path, monkeypatch, handoff, cleanup_failure
+):
+    from sidecar.demo import PREFIX, DemoDevice, DemoPolicy
+    from sidecar.displays import DisplayBinding
+    from sidecar.jobs import JobQueue, Settings
+    from sidecar.worker import run_next
+
+    class Device(DemoDevice):
+        closed = False
+
+        def launch(self):
+            pass
+
+        def execution_lock(self):
+            from contextlib import nullcontext
+
+            return nullcontext()
+
+        def close_app(self):
+            self.closed = True
+            if cleanup_failure:
+                raise RuntimeError("device unavailable")
+
+    device = Device(tmp_path / "engine")
+    state = device.load()
+    state["logged_in"] = not handoff
+    device.save(state)
+    monkeypatch.setenv("SIDECAR_MODEL", "test")
+    monkeypatch.delenv("SIDECAR_BASE_URL", raising=False)
+    monkeypatch.setattr("sidecar.android.AndroidDevice", lambda *a, **kw: device)
+    monkeypatch.setattr("sidecar.worker.LangChainModel.from_env", lambda: DemoPolicy())
+    q = JobQueue(tmp_path)
+    q.configure(
+        Settings(
+            mode="android",
+            package="com.clock",
+            model="test",
+            display=DisplayBinding(id=2, unique_id="virtual:test", boot_id="boot-a"),
+        )
+    )
+    job = q.submit("task", criteria=[PREFIX + "test"])
+    run_next(tmp_path)
+    assert q.get(job["id"])["status"] == ("waiting_user" if handoff else "completed")
+    assert device.closed is not handoff
+    assert any(e["kind"] == "cleanup_error" for e in q.events(job["id"])) == (
+        cleanup_failure and not handoff
+    )

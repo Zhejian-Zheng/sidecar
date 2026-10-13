@@ -539,3 +539,66 @@ def test_android_result_is_not_presented_as_demo():
     text = format_result(job)
     assert "任务已完成" in text and "时钟页面显示 21:00" in text
     assert "离线演示" not in text
+
+
+def test_chat_goal_routes_to_named_allowed_app_before_queueing(tmp_path):
+    from sidecar.jobs import JobQueue, Settings
+    from sidecar.openai_compat import prepare_completion
+
+    q = JobQueue(tmp_path)
+    q.configure(
+        Settings(
+            mode="android",
+            package="com.tencent.weread",
+            allowed_packages=["com.tencent.weread", "notion.id", "com.custom.notes"],
+            app_aliases={"com.custom.notes": ["我的笔记"]},
+            model="test",
+        )
+    )
+    for goal, package in [
+        ("帮我在notion中的private创建测试", "notion.id"),
+        ("在微信读书找西游记", "com.tencent.weread"),
+        ("在我的笔记新建清单", "com.custom.notes"),
+    ]:
+        job, _ = prepare_completion(q, goal)
+        assert job["request"]["app"] == package
+        assert prepare_completion(q, goal)[0]["id"] == job["id"]
+
+
+def test_unallowed_or_ambiguous_chat_app_is_rejected_before_queueing(tmp_path):
+    from sidecar.jobs import JobQueue, Settings
+    from sidecar.openai_compat import prepare_completion
+
+    q = JobQueue(tmp_path)
+    q.configure(Settings(mode="android", package="com.tencent.weread", model="test"))
+    with pytest.raises(ValueError, match="允许"):
+        prepare_completion(q, "在Notion创建页面")
+    assert not q.list()
+    q.configure(
+        Settings(
+            mode="android",
+            package="com.tencent.weread",
+            allowed_packages=["notion.id"],
+            model="test",
+        )
+    )
+    with pytest.raises(ValueError, match="多个"):
+        prepare_completion(q, "从微信读书复制到Notion")
+    assert not q.list()
+
+
+def test_chat_retry_keeps_original_target_after_app_configuration_changes(tmp_path):
+    from sidecar.jobs import JobQueue, Settings
+    from sidecar.openai_compat import prepare_completion
+
+    q = JobQueue(tmp_path)
+    q.configure(Settings(mode="android", package="com.a", model="test"))
+    first, _ = prepare_completion(q, "创建清单", "stable")
+    q.control(first["id"], "cancel")
+    q.configure(
+        Settings(mode="android", package="com.b", allowed_packages=["com.b", "com.c"], model="test")
+    )
+    retry, _ = prepare_completion(q, "创建清单", "stable")
+    assert retry["id"] == first["id"]
+    assert retry["request"]["app"] == "com.a"
+    assert len(q.list()) == 1

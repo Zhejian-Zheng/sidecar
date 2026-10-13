@@ -24,7 +24,8 @@ class Settings(Message):
     mode: Literal["demo", "android"] = "demo"
     serial: str = "emulator-5554"
     package: str = ""
-    allowed_packages: list[str] = Field(default_factory=list, max_length=20)
+    allowed_packages: list[str] = Field(default_factory=list, max_length=256)
+    app_aliases: dict[str, list[str]] = Field(default_factory=dict, max_length=256)
     model: str = ""
     base_url: str = ""
     display: DisplayBinding | None = None
@@ -46,6 +47,9 @@ class Settings(Message):
                 raise ValueError("App 包名格式不正确")
             self.allowed_packages = allowed
             self.package = self.package or allowed[0]
+            for package, names in self.app_aliases.items():
+                if package not in allowed or not names or any(not n.strip() for n in names):
+                    raise ValueError("App 别名必须非空，且只可绑定允许列表内的 App")
         return self
 
 

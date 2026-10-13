@@ -88,6 +88,18 @@ def run_next(home):
                 result = h.resume(task_id, job["note"])
             else:
                 result = h.start(task, task_id=task_id, prepare=prepare)
+        if config.display and result["status"] in TERMINAL:
+            try:
+                with device.execution_lock():
+                    device.close_app()
+            except Exception as exc:
+                # A cleanup error must not erase verified task results or replay its actions.
+                result["reason"] += "；副屏应用未能退出，请核对执行画面"
+                store = Store(q.engine)
+                try:
+                    store.event(task_id, "cleanup_error", {"type": type(exc).__name__})
+                finally:
+                    store.close()
         q.finish(task_id, result["status"], result["reason"])
     except Exception as exc:
         # Never store exception bodies: providers and devices may include secrets.

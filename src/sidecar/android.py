@@ -92,6 +92,10 @@ class AndroidDevice:
     def launch(self):
         self.transport.call("launch", {"package": self.package})
 
+    def close_app(self):
+        if self.display:
+            self.transport.call("close_app")
+
     # 按设备编号加文件锁，限制同一用户下同时操作该设备的执行者。
     @contextmanager
     def execution_lock(self):

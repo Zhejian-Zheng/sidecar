@@ -317,3 +317,46 @@ def hidden_display(serial):
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait(timeout=5)
+
+
+def app_stacks(text):
+    """Parse Android's root task inventory, retaining display and component ownership."""
+    blocks = re.split(r"(?m)^RootTask id=(\d+) [^\n]*?displayId=(\d+)[^\n]*\n", text)
+    stacks = {}
+    for i in range(1, len(blocks), 3):
+        body = blocks[i + 2]
+        packages = set(re.findall(r"taskId=\d+: ([\w.]+)/", body))
+        packages.update(re.findall(r"topActivity=ComponentInfo\{([\w.]+)/", body))
+        unknown = len(re.findall(r"taskId=\d+:", body)) != len(
+            re.findall(r"taskId=\d+: [\w.]+/", body)
+        )
+        stacks[int(blocks[i])] = (int(blocks[i + 1]), packages, unknown)
+    return stacks
+
+
+def close_app(serial, binding, package):
+    """Remove only this app's root tasks on the bound display; never force-stop a package."""
+    verify(serial, binding)
+    inventory = app_stacks(shell(serial, ["am", "stack", "list"]))
+    targets = {
+        key: item for key, item in inventory.items() if item[0] == binding.id and package in item[1]
+    }
+    if any(item[1] != {package} or item[2] for item in targets.values()):
+        raise RuntimeError("App shares a stack; refusing to close unrelated activities")
+    if any(item[0] != binding.id and package in item[1] for item in inventory.values()):
+        raise RuntimeError("App also has a window on another display; keeping it open")
+    for key, expected in targets.items():
+        verify(serial, binding)
+        fresh = app_stacks(shell(serial, ["am", "stack", "list"]))
+        if fresh.get(key) != expected or any(
+            item[0] != binding.id and package in item[1] for item in fresh.values()
+        ):
+            raise RuntimeError("App moved before cleanup; refusing to close it")
+        shell(serial, ["am", "stack", "remove", str(key)])
+    for _ in range(10):
+        verify(serial, binding)
+        remaining = app_stacks(shell(serial, ["am", "stack", "list"]))
+        if not any(item[0] == binding.id and package in item[1] for item in remaining.values()):
+            return
+        time.sleep(0.2)  # Android removes the task asynchronously; retry only the read.
+    raise RuntimeError("App did not close on hidden display")

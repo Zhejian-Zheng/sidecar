@@ -55,7 +55,14 @@ def parser():
     serve.add_argument(
         "--allowed-packages",
         default="",
-        help="Comma-separated allow-list of app packages, e.g. com.a,com.b (multi-app tasks)",
+        help="Comma-separated allow-list of app packages, e.g. com.a,com.b (one app per task)",
+    )
+    serve.add_argument(
+        "--app-alias",
+        action="append",
+        default=[],
+        metavar="PACKAGE=NAME",
+        help="Name used to select an allowed app in chat; repeat for more names",
     )
     worker = commands.add_parser("worker", help="Run the queue worker independently")
     worker.add_argument("--once", action="store_true")
@@ -133,11 +140,18 @@ def main():
             from sidecar.server import create_app, pairing_token, start_worker
 
             allowed = [name.strip() for name in args.allowed_packages.split(",") if name.strip()]
+            aliases = {}
+            for entry in args.app_alias:
+                package, separator, name = entry.partition("=")
+                if not separator or not package.strip() or not name.strip():
+                    raise ValueError("--app-alias 格式为 包名=应用名称")
+                aliases.setdefault(package.strip(), []).append(name.strip())
             config = Settings(
                 mode="android" if args.android else "demo",
                 serial=args.serial,
                 package=args.package or (allowed[0] if allowed else ""),
                 allowed_packages=allowed,
+                app_aliases=aliases,
                 model=os.environ.get("SIDECAR_MODEL", ""),
                 base_url=os.environ.get("SIDECAR_BASE_URL", ""),
             )

@@ -152,6 +152,19 @@ sidecar --home ~/.sidecar/android-work serve --android --hidden-display \
   --package com.tencent.weread
 ```
 
+Cherry Studio 请求现在会在入队前，根据任务中明确出现的应用名称选择目标。例如“在 Notion 中创建页面”和“在微信读书搜索西游记”会分别选择对应 App，不会继续沿用上一项任务的软件。目标未获允许、提到多个 App，或多 App 配置下没有明确目标时，会要求补充说明，不创建任务。一项任务目前只操作一个 App。
+
+内置名称识别包含 Notion、微信读书/微信阅读/WeRead、时钟/闹钟/Clock、Microsoft To Do/微软待办；它们不是软件支持上限。允许列表和别名配置各支持最多 256 个应用。名称重叠时优先匹配完整的长名称，例如 YouTube Music 不会同时匹配 YouTube；分别提到两个应用时仍要求拆分任务。新增安装的软件需要加入允许列表并配置别名，不会自动授权。其他 App 可以通过包名指定，也可重复传入 `--app-alias 包名=名称` 配置聊天中使用的名称。例如：
+
+```sh
+sidecar --home ~/.sidecar/android-clock serve --android --hidden-display \
+  --serial emulator-5554 --port 8766 --package com.tencent.weread \
+  --allowed-packages com.tencent.weread,notion.id \
+  --app-alias notion.id=Notion
+```
+
+副屏任务完成、失败或在执行期间取消后，worker 会关闭属于该 App 的副屏任务窗口，再领取下一项任务。退出操作核对显示屏和窗口归属，不使用全局强制停止；发现同一 App 也在其他屏幕上或窗口归属混杂时，会保留窗口并记录提示。暂停、等待用户接管或结果不确定的中断会保留现场。关闭窗口不代表清除 App 数据；完成前仍需要验证用户要求的修改已保存。
+
 提交任务时可带 `app` 字段指定本任务的目标 App（必须是允许列表内的包名）；网页在允许多个 App 时会显示「目标 App」下拉。任务级 `app` 越界会在提交阶段被拒绝（HTTP 409）。观察到的前台 App 不在允许列表、或不是本任务目标时，一律交接给用户，不会误操作其它 App。
 
 新任务会打开该任务的目标 App；暂停恢复时保留现场并重新观察。登录、验证码、支付、转账、发送、发布等敏感页面会停止自动操作；删除入口及与其区域重叠的控件被禁止操作。带删除入口的页面仅允许读取、等待或操作明确且不重叠的独立控件，禁止坐标、滑动和返回。这些是保守的界面规则，不是对任意 App 的完整风险识别保证。加入允许列表的每个 App 仍需单独验证其界面规则。模拟器闹钟只在模拟器内生效，不会设置 iPhone 的系统闹钟。

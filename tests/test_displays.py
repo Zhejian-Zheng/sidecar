@@ -234,3 +234,106 @@ def test_text_bridge_rejects_unverified_result_without_replay(monkeypatch, respo
             },
         )
     assert len(writes) == 1
+
+
+def test_close_app_removes_only_its_secondary_stack(monkeypatch):
+    from sidecar import displays
+
+    snapshot = (
+        "RootTask id=10 bounds=[0,0][320,640] displayId=0 userId=0\n"
+        "  taskId=10: com.youtube/.Main topActivity=ComponentInfo{com.youtube/.Main}\n"
+        "RootTask id=20 bounds=[0,0][320,640] displayId=2 userId=0\n"
+        "  taskId=20: com.clock/.Main topActivity=ComponentInfo{com.clock/.Main}\n"
+        "RootTask id=30 bounds=[0,0][320,640] displayId=2 userId=0\n"
+        "  taskId=30: com.reader/.Main topActivity=ComponentInfo{com.reader/.Main}\n"
+    )
+    writes = []
+    closing = [True]
+
+    def shell(serial, args):
+        if args == ["am", "stack", "list"]:
+            if writes and closing:
+                closing.pop()
+                return snapshot
+            return (
+                snapshot
+                if not writes
+                else (
+                    "RootTask id=10 bounds=[0,0][320,640] displayId=0 userId=0\n"
+                    "  taskId=10: com.youtube/.Main topActivity=ComponentInfo{com.youtube/.Main}\n"
+                    "RootTask id=30 bounds=[0,0][320,640] displayId=2 userId=0\n"
+                    "  taskId=30: com.reader/.Main topActivity=ComponentInfo{com.reader/.Main}\n"
+                )
+            )
+        writes.append(args)
+        return ""
+
+    monkeypatch.setattr(displays, "verify", lambda *args: {})
+    monkeypatch.setattr(displays, "shell", shell)
+    binding = displays.DisplayBinding(id=2, unique_id="virtual:test", boot_id="boot-a")
+    displays.close_app("emulator-test", binding, "com.clock")
+    assert writes == [["am", "stack", "remove", "20"]]
+
+
+def test_close_app_refuses_stack_shared_with_another_app(monkeypatch):
+    from sidecar import displays
+
+    monkeypatch.setattr(displays, "verify", lambda *args: {})
+    reads = (
+        "RootTask id=20 bounds=[0,0][320,640] displayId=2 userId=0\n"
+        "  taskId=20: com.clock/.Main topActivity=ComponentInfo{com.other/.Popup}\n"
+    )
+    writes = []
+    monkeypatch.setattr(
+        displays,
+        "shell",
+        lambda serial, args: reads if args == ["am", "stack", "list"] else writes.append(args),
+    )
+    binding = displays.DisplayBinding(id=2, unique_id="virtual:test", boot_id="boot-a")
+    with pytest.raises(RuntimeError):
+        displays.close_app("emulator-test", binding, "com.clock")
+    assert not writes
+
+
+def test_close_app_refuses_when_same_package_is_on_main_display(monkeypatch):
+    from sidecar import displays
+
+    monkeypatch.setattr(displays, "verify", lambda *args: {})
+    snapshot = (
+        "RootTask id=10 bounds=[0,0][320,640] displayId=0 userId=0\n"
+        "  taskId=10: com.clock/.Main\n"
+        "RootTask id=20 bounds=[0,0][320,640] displayId=2 userId=0\n"
+        "  taskId=20: com.clock/.Main\n"
+    )
+    writes = []
+    monkeypatch.setattr(
+        displays,
+        "shell",
+        lambda serial, args: snapshot if args == ["am", "stack", "list"] else writes.append(args),
+    )
+    binding = displays.DisplayBinding(id=2, unique_id="virtual:test", boot_id="boot-a")
+    with pytest.raises(RuntimeError, match="another display"):
+        displays.close_app("emulator-test", binding, "com.clock")
+    assert not writes
+
+
+def test_close_app_does_not_follow_a_task_moved_to_main_display(monkeypatch):
+    from sidecar import displays
+
+    monkeypatch.setattr(displays, "verify", lambda *args: {})
+    snapshot = (
+        "RootTask id=20 bounds=[0,0][320,640] displayId=2 userId=0\n  taskId=20: com.clock/.Main\n"
+    )
+    reads = iter([snapshot, snapshot.replace("displayId=2", "displayId=0")])
+    writes = []
+    monkeypatch.setattr(
+        displays,
+        "shell",
+        lambda serial, args: (
+            next(reads) if args == ["am", "stack", "list"] else writes.append(args)
+        ),
+    )
+    binding = displays.DisplayBinding(id=2, unique_id="virtual:test", boot_id="boot-a")
+    with pytest.raises(RuntimeError, match="moved"):
+        displays.close_app("emulator-test", binding, "com.clock")
+    assert not writes
