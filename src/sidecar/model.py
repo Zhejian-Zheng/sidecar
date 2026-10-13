@@ -17,11 +17,20 @@ Do not invent coordinates or elements. Never enter credentials or perform paymen
 security changes, or destructive actions; request handoff instead.
 Never send or publish messages or transfer money. Only operate the
 configured target app; request handoff when the task requires a different app.
+The mere presence of a Send/Pay/Submit control is not a reason to stop preparing.
+Fill and check the user's requested non-secret fields using safe explicit targets.
+Never tap a confirmation_targets control or its containing parent; never bypass it
+using coordinates, gestures, keyboard submit, or another route. Once preparation is
+complete, choose finish for independent verification; do not claim submission occurred.
+For draft-only tasks, save the draft and verify it without sending. Use a safe explicit
+navigation/save target if necessary. If preparation is incomplete, continue safe work
+or ask for the specific missing information; do not claim everything else is done.
 Use checked=true for an enabled switch or selected radio option; checked=false means off
 or unselected. Do not confuse focused with checked. Read the NEW state after each action;
-do not repeat an action when its intended effect is already visible. Save/confirm pending
-edits before finishing. Finish only when every required result is visibly present, ready
-for a separate check of every criterion; an absent requested result is not success.
+do not repeat an action when its intended effect is already visible. Save pending edits
+using non-submitting controls before finishing. Choose finish when every required result
+is visibly present, or all safe preparation is visibly ready for a final human submission.
+The verifier checks every original criterion; an absent requested result is not success.
 If an earlier write has uncertain outcome, inspect
 the current state and ask the user rather than blindly resubmitting. A human handoff note
 does not authorize new unrelated actions. Give a short action explanation, not hidden reasoning.
@@ -128,6 +137,10 @@ class LangChainModel:
                         "Extract concrete, visible acceptance criteria for this GUI task. "
                         "Preserve user intent. Do not add actions, accounts or purchases. "
                         "Each criterion must be verifiable in the target app. "
+                        "For sending/payment/publishing tasks, separate verifiable preparation "
+                        "(recipient or payee, requested content/items, amount when applicable) "
+                        "from the final submission result into separate criteria. "
+                        "For draft-only tasks, require a saved unsent draft, never a sent message. "
                         "Return the original goal and 1 to 20 criteria."
                     ),
                     HumanMessage(goal),
@@ -145,6 +158,16 @@ class LangChainModel:
         if verify:
             prompt += "\nVerify every criterion exactly once against this NEW observation. "
             prompt += "Quote concrete visible evidence; mark uncertain or missing evidence false."
+            prompt += (
+                " Set requires_confirmation=true only for an unmet criterion that solely "
+                "requires the user's final send/pay/submit action, with a corresponding "
+                "confirmation_targets control visible. Keep passed=false for that criterion. "
+                "Missing recipient, content, amount, unsaved edits or other incomplete "
+                "preparation must remain passed=false and requires_confirmation=false. "
+                "A criterion combining preparation and submission cannot be deferred unless "
+                "all its preparation is visibly verified. Do not omit any original criteria. "
+                "Button presence alone is never evidence that preparation is complete."
+            )
         payload = {
             "task": task.model_dump(),
             "observation": observation.model_dump(exclude={"image"}),

@@ -15,34 +15,62 @@ from sidecar.offline import PREFIX, OfflineDevice, OfflinePolicy
 from sidecar.store import Store
 
 
-# 核对上次执行中的任务：同步终态、处理取消，其余标为需要人工核对的中断。
+# 把引擎里遗留的非终态任务收尾，解除它对工作区的占用。
+def _settle_engine(q, task_id, reason):
+    store = Store(q.engine)
+    try:
+        state = store.get(task_id)
+        if state["status"] in TERMINAL:
+            return
+        state.update(status="cancelled", reason=reason)
+        store.save(state)
+        store.event(task_id, "status", {"status": state["status"], "reason": state["reason"]})
+    except ValueError:
+        pass  # 引擎里没有该任务。
+    finally:
+        store.close()
+
+
+# 启动时对账队列与引擎：任何「引擎非终态但队列已终态」的组合都会永久锁死工作区。
 def recover(home):
     q = JobQueue(home)
     with q.db() as db:
-        rows = db.execute("SELECT id,control FROM jobs WHERE status='executing'").fetchall()
+        rows = db.execute("SELECT id,control,status FROM jobs").fetchall()
     for row in rows:
-        state = q.state(row["id"])
+        task_id, control, status = row["id"], row["control"], row["status"]
+        state = q.state(task_id)
         if state and state["status"] in TERMINAL:
-            q.finish(row["id"], state["status"], state["reason"])
-        elif row["control"] == "cancel":
-            q.control(row["id"], "cancel")
-            if state:
-                with Harness(q.engine, OfflineDevice(q.engine), OfflinePolicy()) as h:
-                    h.control(row["id"], "cancel")
-            q.finish(row["id"], "cancelled", "已取消中断任务")
-        else:
-            q.finish(row["id"], "interrupted", "执行进程中断，请核对设备后继续或取消")
+            # 引擎已有结论：用它对齐尚未写回的队列行。
+            if status not in TERMINAL:
+                q.finish(task_id, state["status"], state["reason"])
+            continue
+        if status in TERMINAL:
+            # 队列已终态、引擎仍活着：这正是锁死工作区的组合，必须收尾引擎。
+            _settle_engine(q, task_id, "队列已结束，清理遗留执行现场")
+            continue
+        if control == "cancel" or status == "cancelled":
+            _settle_engine(q, task_id, "中断后已取消，不再发出新操作")
+            q.finish(task_id, "cancelled", "已取消中断任务")
+        elif status == "executing":
+            q.finish(task_id, "interrupted", "执行进程中断，请核对设备后继续或取消")
+        # paused / waiting_user：保留现场，等用户核对后恢复。
 
 
 # 领取一项任务，选择设备和模型，调用 Harness 后写回队列状态。
 def run_next(home):
     q = JobQueue(home)
+    config = q.settings()
+    # 前置校验放在领取之前：条件不满足时保持队列不动，避免把整个队列逐个消费成失败。
+    if config.mode == "android" and (
+        os.environ.get("SIDECAR_MODEL") != config.model
+        or os.environ.get("SIDECAR_BASE_URL", "") != config.base_url
+    ):
+        return False
     job = q.claim()
     if not job:
         return False
     task_id = job["id"]
     try:
-        config = q.settings()
         request = json.loads(job["body"])
         saved = q.state(task_id)
         if config.mode == "demo":
@@ -50,11 +78,6 @@ def run_next(home):
         else:
             from sidecar.android import AndroidDevice
 
-            if (
-                os.environ.get("SIDECAR_MODEL") != config.model
-                or os.environ.get("SIDECAR_BASE_URL", "") != config.base_url
-            ):
-                raise ValueError("模型配置已变化，请重新启动服务")
             options = {"display": config.display} if config.display else {}
             # 任务级目标 App：显式 app 优先，否则用默认 package；越界即拒绝执行。
             target = q.target_package(request, config)
@@ -102,8 +125,15 @@ def run_next(home):
                     store.close()
         q.finish(task_id, result["status"], result["reason"])
     except Exception as exc:
-        # Never store exception bodies: providers and devices may include secrets.
-        q.finish(task_id, "failed", f"执行失败（{type(exc).__name__}），请检查设备和模型配置")
+        # 先读引擎状态：已完成的任务不能被兜底报成失败，未完成的要留成可恢复的中断。
+        state = q.state(task_id)
+        if state and state["status"] in TERMINAL:
+            q.finish(task_id, state["status"], state["reason"])
+        elif state:
+            q.finish(task_id, "interrupted", "执行中断，请核对设备后继续或取消")
+        else:
+            # Never store exception bodies: providers and devices may include secrets.
+            q.finish(task_id, "failed", f"执行失败（{type(exc).__name__}），请检查设备和模型配置")
     return True
 
 

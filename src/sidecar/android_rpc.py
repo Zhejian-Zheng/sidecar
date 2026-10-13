@@ -6,7 +6,9 @@ import io
 import json
 import sys
 import time
-from contextlib import redirect_stdout
+from contextlib import nullcontext, redirect_stdout, suppress
+
+from sidecar.errors import ObservationError, observation_stage
 
 
 def connect_device(serial):
@@ -41,25 +43,31 @@ def launch_app(device, package):
 
 
 # 连接指定 Android；读取截图和控件，或把单步动作转换为自动化工具调用。
-def main():
+def run():
     request = json.load(sys.stdin)
     if request.get("display") is not None:
-        print(json.dumps(display_request(request)))
-        return
+        return display_request(request)
     with redirect_stdout(sys.stderr):
-        d = connect_device(request["serial"])
+        with observation_stage("connection") if request["op"] == "observe" else nullcontext():
+            d = connect_device(request["serial"])
         d.settings["wait_timeout"] = 5
         # 观察包含当前 App、完整控件树和缩小后的截图，供主进程解析。
         if request["op"] == "launch":
             launch_app(d, request["payload"]["package"])
             response = {}
         elif request["op"] == "observe":
-            current = d.app_current()
-            xml = d.dump_hierarchy()
-            image = d.screenshot()
-            image.thumbnail((960, 1600))
-            out = io.BytesIO()
-            image.save(out, format="PNG")
+            with observation_stage("foreground"):
+                current = d.app_current()
+            with observation_stage("hierarchy"):
+                xml = d.dump_hierarchy()
+            with observation_stage("screenshot"):
+                image = d.screenshot()
+                image.thumbnail((960, 1600))
+                out = io.BytesIO()
+                image.save(out, format="PNG")
+            with observation_stage("page_changed"):
+                if d.app_current() != current:
+                    raise ObservationError("page_changed")
             response = dict(
                 xml=xml,
                 package=current["package"],
@@ -94,7 +102,21 @@ def main():
             response = {}
         else:
             raise ValueError("Unsupported operation")
-    print(json.dumps(response))
+    return response
+
+
+# 只让受控消息跨进程边界：其它异常降级为类型名，避免泄露 traceback 或敏感内容。
+def main():
+    from sidecar.contracts import DeviceSetupError
+
+    try:
+        print(json.dumps(run()))
+    except ObservationError as exc:
+        print(json.dumps({"error": {"observation_stage": exc.stage}}))
+    except Exception as exc:
+        setup = isinstance(exc, DeviceSetupError)
+        message = str(exc) if setup else type(exc).__name__
+        print(json.dumps({"error": {"setup": setup, "message": message}}))
 
 
 def display_request(request):
@@ -110,15 +132,22 @@ def display_request(request):
         elif request["op"] == "close_app":
             displays.close_app(serial, binding, request["package"])
         elif request["op"] == "observe":
-            device = connect_device(serial)
+            with observation_stage("connection"):
+                device = connect_device(serial)
             try:
                 package, activity, xml, image = displays.observe(serial, binding, device)
-            finally:
-                # Release our automation connection before the next node-write bridge starts.
-                device.stop_uiautomator()
-            image.thumbnail((960, 1600))
-            out = io.BytesIO()
-            image.save(out, format="PNG")
+            except Exception:
+                # A release failure must not overwrite the original capture failure.
+                with suppress(Exception):
+                    device.stop_uiautomator()
+                raise
+            else:
+                with observation_stage("release"):
+                    device.stop_uiautomator()
+            with observation_stage("screenshot"):
+                image.thumbnail((960, 1600))
+                out = io.BytesIO()
+                image.save(out, format="PNG")
             return dict(
                 package=package,
                 activity=activity,

@@ -140,6 +140,24 @@ def format_result(job, *, mode=None, include_heading=True):
             lines.append("⚠️ 副屏应用未能退出，请核对执行画面。")
         return heading + "\n".join(lines)
     if status in HANDOFF:
+        if (state.get("observation") or {}).get("confirmation_targets") and state.get(
+            "verification"
+        ):
+            lines = [f"⚠️ 需要你介入：{reason}"]
+            for check in state["verification"].get("checks", []):
+                mark = (
+                    "已核对"
+                    if check.get("passed")
+                    else (
+                        "待你最终提交" if check.get("requires_confirmation") else "未完成或未确认"
+                    )
+                )
+                lines.append(f"- {check.get('criterion', '')}：{mark}。{check.get('evidence', '')}")
+            lines.append(
+                f"请在应用中核对并手动操作；完成后回复：继续 {job['id']}。"
+                "回复继续不会授权自动点击发送或支付。"
+            )
+            return heading + "\n".join(lines)
         return heading + f"⚠️ 需要你介入：{reason}\n处理完成后，请回复：继续 {job['id']}"
     if status == "cancelled":
         return heading + f"已取消：{reason}"

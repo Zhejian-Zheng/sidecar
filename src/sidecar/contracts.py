@@ -35,6 +35,8 @@ class Observation(Message):
     elements: dict[str, str] = Field(default_factory=dict, max_length=200)
     image: str | None = Field(default=None, max_length=6_000_000)
     requires_human: bool = False
+    # Identified controls that the executor must leave to the user.
+    confirmation_targets: dict[str, str] = Field(default_factory=dict, max_length=200)
 
     # 只接收内联图片，避免把任意远程图片链接传入后续流程。
     @field_validator("image")
@@ -90,6 +92,7 @@ class Check(Message):
     criterion: str
     passed: bool
     evidence: str = Field(max_length=1000)
+    requires_confirmation: bool = False
 
 
 # 汇总逐项验证结果；模型声称完成后仍须经过这里检查。
@@ -101,8 +104,24 @@ class Verification(Message):
         return (
             len(self.checks) == len(task.criteria)
             and {c.criterion for c in self.checks} == set(task.criteria)
-            and all(c.passed and c.evidence.strip() for c in self.checks)
+            and all(
+                c.passed and not c.requires_confirmation and c.evidence.strip() for c in self.checks
+            )
         )
+
+    def ready_for_confirmation(self, task: Task) -> bool:
+        return (
+            len(self.checks) == len(task.criteria)
+            and {c.criterion for c in self.checks} == set(task.criteria)
+            and any(c.passed for c in self.checks)
+            and any(c.requires_confirmation for c in self.checks)
+            and all(c.passed != c.requires_confirmation and c.evidence.strip() for c in self.checks)
+        )
+
+
+# 准备阶段的可读失败；只有这类消息才允许跨越进程边界并展示给用户。
+class DeviceSetupError(RuntimeError):
+    """Setup-stage device failure whose message is safe to show the user."""
 
 
 # 设备适配器的接口约定，让核心流程不依赖具体手机工具。

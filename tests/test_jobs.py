@@ -240,16 +240,24 @@ def test_new_android_task_launches_app_unless_cancelled(tmp_path, monkeypatch, c
     assert q.get(job["id"])["status"] == ("cancelled" if cancel else "completed")
 
 
-def test_allowed_packages_folds_default_and_validates():
+def test_default_package_never_widens_the_allow_list():
     from sidecar.jobs import Settings
 
+    # 只给 package：它同时充当唯一白名单。
     assert Settings(mode="android", package="com.a", model="m").allowed_packages == ["com.a"]
-    folded = Settings(mode="android", package="com.a", allowed_packages=["com.b"], model="m")
-    assert folded.allowed_packages == ["com.a", "com.b"]
+    # 只给白名单：默认目标取第一项。
+    only_allowed = Settings(mode="android", allowed_packages=["com.b", "com.c"], model="m")
+    assert only_allowed.package == "com.b"
+    # 白名单已给出时，--package 不能扩大它。
+    with pytest.raises(ValueError, match="不在允许列表"):
+        Settings(mode="android", package="com.a", allowed_packages=["com.b"], model="m")
     with pytest.raises(ValueError, match="允许的 App"):
         Settings(mode="android", model="m")
     with pytest.raises(ValueError, match="包名"):
         Settings(mode="android", allowed_packages=["bad name"], model="m")
+    # 非 ASCII 包名在启动校验就被拒绝，而不是等到设备侧失败。
+    with pytest.raises(ValueError, match="包名"):
+        Settings(mode="android", allowed_packages=["com.app.应用"], model="m")
 
 
 def test_task_app_must_be_in_allow_list(tmp_path):
@@ -353,3 +361,85 @@ def test_worker_closes_finished_hidden_app_but_keeps_handoff(
     assert any(e["kind"] == "cleanup_error" for e in q.events(job["id"])) == (
         cleanup_failure and not handoff
     )
+
+
+def test_recover_settles_engine_left_behind_by_a_terminal_queue_row(tmp_path):
+    """队列已终态、引擎仍非终态时会永久锁死工作区；recover 必须收尾引擎。"""
+    from sidecar.jobs import JobQueue
+    from sidecar.store import Store
+    from sidecar.worker import recover
+
+    q = JobQueue(tmp_path)
+    job = q.submit("任务", items=["事项"])
+    task_id = job["id"]
+    q.claim()
+    # 人为制造 H1 的组合：队列行已是终态，引擎里却留着未完成的现场。
+    store = Store(q.engine)
+    try:
+        store.create(
+            {
+                "task_id": task_id,
+                "task": {"goal": "任务", "criteria": ["待办存在：事项"]},
+                "device_id": "offline-demo:x",
+                "status": "waiting_user",
+                "reason": "等待",
+                "decisions": 0,
+                "history": [],
+                "observation": None,
+                "action": None,
+                "verification": None,
+                "fingerprint": "",
+                "stalls": 0,
+                "limits": {"decisions": 30, "stalls": 4, "seconds": 180},
+            }
+        )
+    finally:
+        store.close()
+    q.finish(task_id, "cancelled", "已取消")
+
+    recover(tmp_path)
+
+    store = Store(q.engine)
+    try:
+        assert store.get(task_id)["status"] == "cancelled"
+    finally:
+        store.close()
+    # 工作区不再被占用，新任务可以正常登记。
+    assert q.submit("新任务", items=["第二项"])["status"] == "queued"
+
+
+def test_config_drift_does_not_consume_the_queue(tmp_path, monkeypatch):
+    """模型配置漂移时，worker 不应把排队的任务消费掉。"""
+    from sidecar.jobs import JobQueue, Settings
+    from sidecar.worker import run_next
+
+    q = JobQueue(tmp_path)
+    q.configure(Settings(mode="android", package="com.a", model="expected-model"))
+    job = q.submit("任务")
+    monkeypatch.setenv("SIDECAR_MODEL", "different-model")
+    monkeypatch.delenv("SIDECAR_BASE_URL", raising=False)
+
+    assert run_next(tmp_path) is False
+    assert q.raw(job["id"])["status"] == "queued"
+
+
+def test_worker_fallback_defers_to_engine_terminal_status(tmp_path, monkeypatch):
+    """兜底异常不能把引擎里已经完成的任务改写成失败。"""
+    from sidecar import harness as harness_module
+    from sidecar.jobs import JobQueue, Settings
+    from sidecar.worker import run_next
+
+    q = JobQueue(tmp_path)
+    q.configure(Settings(mode="demo"))
+    job = q.submit("任务", items=["事项"])
+
+    original_exit = harness_module.Harness.__exit__
+
+    def failing_exit(self, *args):
+        original_exit(self, *args)
+        raise RuntimeError("boom after completion")
+
+    monkeypatch.setattr(harness_module.Harness, "__exit__", failing_exit)
+    run_next(tmp_path)
+
+    assert q.get(job["id"])["status"] == "completed"

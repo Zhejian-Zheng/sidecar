@@ -16,7 +16,8 @@ from xml.etree import ElementTree as ET
 
 from pydantic import Field
 
-from sidecar.contracts import Message
+from sidecar.contracts import DeviceSetupError, Message
+from sidecar.errors import ObservationError, observation_stage
 
 
 class DisplayBinding(Message):
@@ -157,12 +158,17 @@ def screenshot(serial, binding):
 
 
 def observe(serial, binding, device):
-    verify(serial, binding)
-    package, activity = current(serial, binding.id)
-    xml = filter_hierarchy(device.dump_hierarchy(), binding.id)
-    image = screenshot(serial, binding)
-    if current(serial, binding.id) != (package, activity):
-        raise RuntimeError("App changed during display capture; re-observe")
+    with observation_stage("display_verify"):
+        verify(serial, binding)
+    with observation_stage("foreground"):
+        package, activity = current(serial, binding.id)
+    with observation_stage("hierarchy"):
+        xml = filter_hierarchy(device.dump_hierarchy(), binding.id)
+    with observation_stage("screenshot"):
+        image = screenshot(serial, binding)
+    with observation_stage("page_changed"):
+        if current(serial, binding.id) != (package, activity):
+            raise ObservationError("page_changed")
     return package, activity, xml, image
 
 
@@ -170,9 +176,15 @@ def launch(serial, binding, package):
     verify(serial, binding)
     if not re.fullmatch(r"[\w.]+", package):
         raise ValueError("Invalid package")
-    # Do not take the app the human is currently using away from the primary screen.
+    # 主屏前台正在用该 App：绝不打断用户。
     if current(serial, 0)[0] == package:
-        raise RuntimeError("Target app is in use on the primary display")
+        raise DeviceSetupError("目标 App 正在主屏使用；请先切换到其他 App，再提交任务")
+    # 主屏还有该 App 的后台任务时，am start 只会把它 reparent 到副屏——等于接管用户自己的
+    # 任务状态，任务结束时 close_app 还会把它删掉。先停掉它，让 Agent 在副屏拿到独立的新任务；
+    # 用户下次打开该 App 是干净启动，不会被 Agent 的操作污染。
+    inventory = app_stacks(shell(serial, ["am", "stack", "list"]))
+    if any(item[0] != binding.id and package in item[1] for item in inventory.values()):
+        shell(serial, ["am", "force-stop", package])
     try:
         if current(serial, binding.id)[0] == package:
             return
@@ -181,7 +193,7 @@ def launch(serial, binding, package):
     resolved = shell(serial, ["cmd", "package", "resolve-activity", "--brief", package])
     component = resolved.splitlines()[-1] if resolved else ""
     if not re.fullmatch(re.escape(package) + r"/[\w.$]+", component):
-        raise RuntimeError("Cannot resolve target launcher")
+        raise DeviceSetupError("无法解析目标 App 的启动入口；请确认它在执行设备上已安装")
     verify(serial, binding)
     shell(serial, ["am", "start", "--display", str(binding.id), "-n", component])
     for _ in range(10):
@@ -191,7 +203,7 @@ def launch(serial, binding, package):
         except RuntimeError:
             pass  # Only repeat the read while the launch animation settles.
         time.sleep(0.2)
-    raise RuntimeError("Target app did not open on hidden display")
+    raise DeviceSetupError("目标 App 未能在隐藏副屏打开；请核对执行画面")
 
 
 def execute(serial, binding, payload):
@@ -341,6 +353,9 @@ def close_app(serial, binding, package):
     targets = {
         key: item for key, item in inventory.items() if item[0] == binding.id and package in item[1]
     }
+    # 副屏上本来就没有该 App 时没有可清理内容；别把「它在别处有窗口」当成清理失败。
+    if not targets:
+        return
     if any(item[1] != {package} or item[2] for item in targets.values()):
         raise RuntimeError("App shares a stack; refusing to close unrelated activities")
     if any(item[0] != binding.id and package in item[1] for item in inventory.values()):

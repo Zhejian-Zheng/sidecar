@@ -26,6 +26,34 @@ def auth():
     return {"Authorization": "Bearer test-pairing-secret"}
 
 
+def test_confirmation_handoff_reports_verified_preparation_and_pending_final_step():
+    content = format_result(
+        {
+            "id": "test-confirmation",
+            "status": "waiting_user",
+            "reason": "准备已完成；最终发送未执行",
+            "state": {
+                "observation": {"confirmation_targets": {"send": "Send"}},
+                "verification": {
+                    "checks": [
+                        {"criterion": "内容已填写", "passed": True, "evidence": "Hello visible"},
+                        {
+                            "criterion": "邮件已发送",
+                            "passed": False,
+                            "requires_confirmation": True,
+                            "evidence": "Send pending",
+                        },
+                    ]
+                },
+            },
+        }
+    )
+    assert "内容已填写：已核对" in content
+    assert "邮件已发送：待你最终提交" in content
+    assert "最终发送未执行" in content
+    assert "不会授权自动点击" in content
+
+
 def start_demo_worker(tmp_path):
     from sidecar.jobs import JobQueue, Settings
     from sidecar.worker import run_worker
@@ -578,7 +606,7 @@ def test_unallowed_or_ambiguous_chat_app_is_rejected_before_queueing(tmp_path):
         Settings(
             mode="android",
             package="com.tencent.weread",
-            allowed_packages=["notion.id"],
+            allowed_packages=["com.tencent.weread", "notion.id"],
             model="test",
         )
     )

@@ -79,7 +79,9 @@ def create_app(home, token=None):
 
     # 核对 Bearer 配对令牌，保护任务、截图和控制接口。
     def authenticate(authorization: str = Header(default="")):
-        if not secrets.compare_digest(authorization, "Bearer " + secret):
+        # 头可能携带 latin-1 高字节；按 bytes 比较，避免 compare_digest 抛 TypeError。
+        given = authorization.encode("utf-8", "surrogateescape")
+        if not secrets.compare_digest(given, ("Bearer " + secret).encode()):
             raise HTTPException(401, "请先输入配对码连接 Sidecar")
 
     # 禁止缓存敏感响应，并限制页面脚本、资源来源和嵌入方式。

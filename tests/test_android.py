@@ -165,13 +165,151 @@ def test_android_launch_is_restricted_to_configured_package():
     assert t.actions == [("launch", {"package": "com.example.todo"})]
 
 
-@pytest.mark.parametrize("label", ["发送消息", "转账", "购买", "Send message", "Transfer money"])
-def test_android_blocks_high_risk_action_screens(label):
+@pytest.mark.parametrize(
+    "label",
+    [
+        "发送消息",
+        "转账",
+        "购买",
+        "Send message",
+        "Transfer money",
+        "确认支付",
+        "Pay now",
+        "发布",
+        "提交订单",
+    ],
+)
+def test_android_allows_preparation_but_blocks_final_action(label):
     d, t = device()
     t.xml = XML.replace('text="保存"', f'text="{label}"')
     obs = d.observe()
-    assert obs.requires_human
-    assert obs.image is None
+    assert not obs.requires_human
+    assert obs.image is not None
+    safe = next(k for k, v in obs.elements.items() if "标题" in v)
+    unsafe = next(k for k, v in obs.elements.items() if label in v)
+    assert unsafe in obs.confirmation_targets
+    assert d.assess(Action(kind="type", target=safe, text="问候", reason="填写"), obs) == "allow"
+    blocked = Action(kind="tap", target=unsafe, reason="提交")
+    assert d.assess(blocked, obs) == "handoff"
+    with pytest.raises(ValueError):
+        d.execute(blocked)
+    assert t.actions == []
+
+
+def test_confirmation_control_blocks_overlapping_parent_and_coordinate_bypass():
+    d, t = device()
+    t.xml = XML.replace('text="保存"', 'text="Send"').replace(
+        "</hierarchy>",
+        '<node package="com.example.todo" class="Button" text="parent" '
+        'clickable="true" bounds="[0,0][200,200]"/></hierarchy>',
+    )
+    obs = d.observe()
+    parent = next(k for k, v in obs.elements.items() if "parent" in v)
+    for action in [
+        Action(kind="tap", target=parent, reason="parent"),
+        Action(kind="tap", x=0.5, y=0.5, reason="coordinate"),
+        Action(kind="type", text="test", reason="focused"),
+        Action(kind="swipe", direction="left", reason="swipe"),
+    ]:
+        assert d.assess(action, obs) == "handoff"
+
+
+def test_draft_text_with_send_word_is_not_a_submission_control():
+    d, t = device()
+    t.xml = XML.replace('text=""', 'text="Please send your reply"')
+    obs = d.observe()
+    assert not obs.requires_human
+    assert not obs.confirmation_targets
+
+
+def test_submission_resource_id_is_blocked_without_visible_label():
+    d, t = device()
+    t.xml = XML.replace('resource-id="save"', 'resource-id="com.test:id/submit_order"').replace(
+        'text="保存"', 'text=""'
+    )
+    obs = d.observe()
+    assert not obs.requires_human
+    assert obs.confirmation_targets
+
+
+def test_send_button_does_not_block_safe_draft_navigation():
+    d, t = device()
+    t.xml = XML.replace('text="保存"', 'text="Send"').replace(
+        "</hierarchy>",
+        '<node package="com.example.todo" class="Button" text="Navigate up" '
+        'clickable="true" bounds="[0,0][10,10]"/></hierarchy>',
+    )
+    obs = d.observe()
+    target = next(k for k, v in obs.elements.items() if "Navigate up" in v)
+    assert d.assess(Action(kind="tap", target=target, reason="save draft"), obs) == "allow"
+
+
+def test_harness_fills_content_then_hands_off_without_sending(tmp_path):
+    from sidecar.android import AndroidDevice
+    from sidecar.contracts import Check, Task, Verification
+    from sidecar.harness import Harness
+
+    class Composer(Transport):
+        def __init__(self):
+            super().__init__()
+            self.xml = XML.replace('text="保存"', 'text="Send"')
+
+        def call(self, op, payload=None):
+            response = super().call(op, payload)
+            if op == "execute":
+                assert payload["kind"] == "type", "Final Send must never reach device RPC"
+                self.xml = self.xml.replace('text=""', 'text="Hello Kevin"')
+            return response
+
+    class Policy:
+        def decide(self, task, observation, history):
+            if "Hello Kevin" not in observation.text:
+                target = next(k for k, v in observation.elements.items() if "标题" in v)
+                return Action(kind="type", target=target, text="Hello Kevin", reason="prepare")
+            return Action(
+                kind="tap", target=next(iter(observation.confirmation_targets)), reason="send"
+            )
+
+        def verify(self, task, observation):
+            return Verification(
+                checks=[
+                    Check(
+                        criterion="greeting prepared",
+                        passed="Hello Kevin" in observation.text,
+                        evidence="Hello Kevin visible in editor",
+                    ),
+                    Check(
+                        criterion="sent",
+                        passed=False,
+                        requires_confirmation=True,
+                        evidence="Send remains available; submission not executed",
+                    ),
+                ]
+            )
+
+    transport = Composer()
+    android = AndroidDevice(
+        "test", "com.example.todo", transport=transport, lock_root=tmp_path / "locks"
+    )
+    with Harness(tmp_path / "engine", android, Policy()) as harness:
+        result = harness.start(Task(goal="send greeting", criteria=["greeting prepared", "sent"]))
+        assert result["status"] == "waiting_user"
+        assert "准备已完成" in result["reason"]
+        assert [payload["kind"] for op, payload in transport.actions] == ["type"]
+
+
+def test_final_control_after_element_limit_still_blocks_coordinate_actions():
+    d, t = device()
+    field = (
+        '<node package="com.example.todo" class="Button" text="ordinary" '
+        'clickable="true" bounds="[1,1][2,2]"/>'
+    )
+    t.xml = (
+        "<hierarchy>" + field * 201 + '<node text="Pay now" bounds="[10,10][20,20]"/></hierarchy>'
+    )
+    obs = d.observe()
+    assert not obs.requires_human
+    assert d.assess(Action(kind="tap", x=0.5, y=0.5, reason="coordinate"), obs) == "handoff"
 
 
 def test_delete_button_does_not_block_reading_or_separate_safe_target():
@@ -228,6 +366,7 @@ def test_transport_read_recovery_is_bounded(monkeypatch):
     import subprocess
 
     from sidecar.android import Transport
+    from sidecar.errors import ObservationError
 
     calls = []
 
@@ -236,7 +375,7 @@ def test_transport_read_recovery_is_bounded(monkeypatch):
         raise subprocess.TimeoutExpired("device", 30)
 
     monkeypatch.setattr("sidecar.android.subprocess.run", timeout)
-    with pytest.raises(subprocess.TimeoutExpired):
+    with pytest.raises(ObservationError, match="通信失败或超时"):
         Transport("emulator-test").call("observe")
     assert len(calls) == 2
 
@@ -334,3 +473,36 @@ def test_allow_list_accepts_any_named_app_as_task_target():
     )
     assert not d.observe().requires_human
     assert d.allowed == ["com.example.todo", "com.tencent.weread"]
+
+
+def test_transport_surfaces_setup_error_message(monkeypatch):
+    import json
+    import subprocess
+
+    from sidecar.android import Transport
+    from sidecar.contracts import DeviceSetupError
+
+    class Result:
+        returncode = 0
+        stdout = json.dumps(
+            {"error": {"setup": True, "message": "目标 App 正在主屏使用；请先切换"}}
+        )
+
+    monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: Result())
+    with pytest.raises(DeviceSetupError, match="主屏"):
+        Transport("emulator-test").call("launch", {"package": "notion.id"})
+
+
+def test_transport_hides_uncontrolled_error_message(monkeypatch):
+    import json
+    import subprocess
+
+    from sidecar.android import Transport
+
+    class Result:
+        returncode = 0
+        stdout = json.dumps({"error": {"setup": False, "message": "RuntimeError"}})
+
+    monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: Result())
+    with pytest.raises(RuntimeError, match="RuntimeError"):
+        Transport("emulator-test").call("close_app")

@@ -14,7 +14,16 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
 from langsmith import tracing_context
 
-from sidecar.contracts import Action, DecisionModel, Device, Observation, Task, Verification
+from sidecar.contracts import (
+    Action,
+    DecisionModel,
+    Device,
+    DeviceSetupError,
+    Observation,
+    Task,
+    Verification,
+)
+from sidecar.errors import ObservationError
 from sidecar.store import Store
 
 TERMINAL = {"completed", "failed", "cancelled"}
@@ -69,6 +78,7 @@ class Harness:
         graph.add_conditional_edges("handoff", self._after_action)
         self.graph = graph.compile(checkpointer=SqliteSaver(self.connection))
         self.deadline = 0.0
+        self.failure_stage = "runtime"
 
     # 支持 with 写法，便于结束执行时统一释放数据库资源。
     def __enter__(self):
@@ -87,6 +97,7 @@ class Harness:
     def _persisted(self, operation):
         # 先运行节点，再合并保存结果；持久层确认的取消状态优先。
         def node(state):
+            self.failure_stage = operation.__name__.lstrip("_")
             update = operation(state)
             saved = self.store.save({**state, **update})
             return {**update, "status": saved["status"], "reason": saved["reason"]}
@@ -118,6 +129,11 @@ class Harness:
             if prepare:
                 try:
                     prepare()
+                except DeviceSetupError as exc:
+                    # 受控的准备错误带有可直接展示给用户的原因。
+                    state.update(status="failed", reason=f"Setup error: {exc}")
+                    self.store.save(state)
+                    return state
                 except Exception as exc:
                     state.update(status="failed", reason=f"Setup error: {type(exc).__name__}")
                     self.store.save(state)
@@ -174,6 +190,7 @@ class Harness:
 
     # 运行状态图，将异常转成任务状态并保存最终结果，避免记录异常正文。
     def _run(self, value, state):
+        self.failure_stage = "runtime"
         self.deadline = time.monotonic() + state["limits"]["seconds"]
         try:
             # Do not inherit a global tracing opt-in for unrelated private GUI data.
@@ -182,8 +199,18 @@ class Harness:
             result = {k: v for k, v in result.items() if not k.startswith("__")}
         except Exception as exc:
             result = dict(self.graph.get_state(self._config(state["task_id"])).values) or state
-            result.update(status="failed", reason=f"Runtime error: {type(exc).__name__}")
-            self.store.event(state["task_id"], "error", {"type": type(exc).__name__})
+            stage = exc.stage if isinstance(exc, ObservationError) else self.failure_stage
+            reason = (
+                str(exc)
+                if isinstance(exc, ObservationError)
+                else (f"执行失败（{type(exc).__name__}），请核对执行记录和设备状态")
+            )
+            result.update(status="failed", reason=reason)
+            self.store.event(
+                state["task_id"],
+                "error",
+                {"type": type(exc).__name__, "stage": stage, "node": self.failure_stage},
+            )
         result = self.store.save(result)
         self.store.event(
             result["task_id"], "status", {"status": result["status"], "reason": result["reason"]}
@@ -295,7 +322,7 @@ class Harness:
         action = Action.model_validate(action)
         self.store.event(state["task_id"], "decision", action.model_dump())
         update = {"action": action.model_dump(), "decisions": state["decisions"] + 1}
-        if action.kind == "handoff":
+        if action.kind == "handoff" and not state["observation"].get("confirmation_targets"):
             update.update(status="waiting_user", reason=action.reason)
         update.update(self._boundary(state))
         return update
@@ -321,6 +348,8 @@ class Harness:
             return {"status": "failed", "reason": "Action references an unknown target"}
         permission = self.device.assess(action, observation)
         if permission != "allow":
+            if permission == "handoff" and action.target in observation.confirmation_targets:
+                return self._verify(state, final_action_blocked=True)
             return {
                 "status": "waiting_user" if permission == "handoff" else "failed",
                 "reason": f"Device policy: {permission}; {action.reason}",
@@ -350,7 +379,7 @@ class Harness:
         return self._history(state, f"{action.kind}: {action.reason}; check next observation")
 
     # 用新的观察逐项验证；证据不足时继续循环，而不是直接报告完成。
-    def _verify(self, state):
+    def _verify(self, state, final_action_blocked=False):
         if stop := self._boundary(state):
             return stop
         observation = self._capture(state)
@@ -369,6 +398,24 @@ class Harness:
             return {
                 "status": "completed",
                 "reason": "All criteria verified",
+                "verification": evidence,
+                "observation": observation.model_dump(),
+            }
+        if observation.confirmation_targets and (
+            final_action_blocked
+            or state["action"]["kind"] == "handoff"
+            or any(c.requires_confirmation for c in verification.checks)
+        ):
+            ready = verification.ready_for_confirmation(task)
+            reason = (
+                "准备已完成并通过核对；发送、支付等最终提交操作未执行，请你核对后手动完成"
+                if ready
+                else "准备尚未全部完成或无法确认；最终提交操作未执行，请核对下列检查结果"
+            )
+            self.store.event(state["task_id"], "confirmation_required", {"prepared": ready})
+            return {
+                "status": "waiting_user",
+                "reason": reason,
                 "verification": evidence,
                 "observation": observation.model_dump(),
             }
@@ -422,7 +469,7 @@ class Harness:
     # 完成请求进入验证，普通动作进入执行；控制状态优先。
     def _after_decide(self, state):
         return self._stop_route(state) or (
-            "verify" if state["action"]["kind"] == "finish" else "execute"
+            "verify" if state["action"]["kind"] in {"finish", "handoff"} else "execute"
         )
 
     # 执行、验证或交接结束后，决定退出还是再次观察。

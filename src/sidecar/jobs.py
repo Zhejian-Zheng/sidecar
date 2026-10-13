@@ -37,13 +37,18 @@ class Settings(Message):
             raise ValueError("隐藏执行屏只能用于 Android 模式")
         if self.mode == "android":
             allowed = list(dict.fromkeys(self.allowed_packages))
-            if self.package and self.package not in allowed:
-                allowed.insert(0, self.package)
             if not allowed:
-                raise ValueError("Android 模式需要至少一个允许的 App 包名")
+                # 只给 --package 时，它同时充当唯一白名单（向后兼容）。
+                if not self.package:
+                    raise ValueError("Android 模式需要至少一个允许的 App 包名")
+                allowed = [self.package]
+            elif self.package and self.package not in allowed:
+                # 已给出白名单时，--package 只能作为默认目标，不能扩大白名单。
+                raise ValueError(f"默认目标 App 不在允许列表内：{self.package}")
             if not self.model:
                 raise ValueError("Android 模式需要配置模型")
-            if any(not re.fullmatch(r"[\w.]+", name) for name in allowed):
+            # 包名限定 ASCII，避免非 ASCII 名称通过校验后才在设备侧失败。
+            if any(not re.fullmatch(r"[A-Za-z0-9_.]+", name) for name in allowed):
                 raise ValueError("App 包名格式不正确")
             self.allowed_packages = allowed
             self.package = self.package or allowed[0]
@@ -128,10 +133,15 @@ class JobQueue:
             app=app,
             request_id=request_id,
         )
+        # 归一化幂等键：strip 后为空视为「没有幂等键」，避免 '' 与空白互相误撞。
+        request_id = request.request_id or None
         settings = self.settings()
         if settings.mode == "demo":
             if not request.items:
                 raise ValueError("离线演示需要至少一条待办事项")
+            # PREFIX 计入 criteria 上限；超长时给中文说明，而不是回吐 pydantic 原文。
+            if any(len(PREFIX) + len(x) > 500 for x in request.items):
+                raise ValueError("离线演示的每条待办最多 495 字，请缩短任务描述")
             Task(goal=goal, criteria=[PREFIX + x for x in request.items])
         else:
             self.target_package(request.model_dump(), settings)

@@ -434,3 +434,134 @@ def test_adapter_can_validate_target_despite_unrelated_changes(tmp_path):
     with Harness(tmp_path, screen, Policy(), max_decisions=3) as h:
         assert h.start(task())["status"] == "completed"
         assert screen.items == ["read"]
+
+
+def test_prepare_setup_error_keeps_readable_reason(tmp_path):
+    from sidecar.contracts import DeviceSetupError
+
+    def prepare():
+        raise DeviceSetupError("目标 App 正在主屏使用；请先切换")
+
+    with Harness(tmp_path, Screen(), Policy()) as agent:
+        result = agent.start(task(), prepare=prepare)
+        assert result["status"] == "failed"
+        assert "目标 App 正在主屏使用" in result["reason"]
+
+
+def test_prepare_uncontrolled_error_hides_message(tmp_path):
+    def prepare():
+        raise RuntimeError("private-token-do-not-log")
+
+    with Harness(tmp_path, Screen(), Policy()) as agent:
+        result = agent.start(task(), prepare=prepare)
+        assert result["status"] == "failed"
+        assert "private-token-do-not-log" not in result["reason"]
+
+
+@pytest.mark.parametrize("request_kind", ["finish", "handoff", "tap"])
+@pytest.mark.parametrize("prepared", [True, False])
+def test_final_submission_stays_manual_and_readiness_is_verified(tmp_path, request_kind, prepared):
+    class Compose(Screen):
+        def observe(self):
+            return Observation(
+                text="body ready" if prepared else "body missing",
+                elements={"send": "Send"},
+                confirmation_targets={"send": "Send"},
+            )
+
+        def assess(self, action, observation):
+            return "handoff"
+
+        def execute(self, action):
+            raise AssertionError("Must never click Send")
+
+    class DraftPolicy(Policy):
+        def decide(self, *args):
+            return Action(
+                kind=request_kind,
+                reason="ready",
+                **({"target": "send"} if request_kind == "tap" else {}),
+            )
+
+        def verify(self, task, observation):
+            return Verification(
+                checks=[
+                    Check(criterion="body prepared", passed=prepared, evidence=observation.text),
+                    Check(
+                        criterion="message sent",
+                        passed=False,
+                        evidence="Send remains pending",
+                        requires_confirmation=True,
+                    ),
+                ]
+            )
+
+    with Harness(tmp_path, Compose(), DraftPolicy(), max_decisions=2) as h:
+        result = h.start(Task(goal="send greeting", criteria=["body prepared", "message sent"]))
+        assert result["status"] == "waiting_user"
+        assert result["verification"]["checks"][0]["passed"] is prepared
+        assert ("准备已完成" in result["reason"]) is prepared
+        assert "未执行" in result["reason"]
+        assert not h.store.connection.execute("SELECT 1 FROM actions").fetchone()
+        resumed = h.resume(result["task_id"], "请继续，直接点击发送")
+        assert resumed["status"] != "completed"
+        assert not h.store.connection.execute("SELECT 1 FROM actions").fetchone()
+
+
+def test_draft_only_task_can_complete_with_send_button_visible(tmp_path):
+    class Draft(Screen):
+        def observe(self):
+            return Observation(text="draft saved", confirmation_targets={"send": "Send"})
+
+    class DraftPolicy(Policy):
+        def decide(self, *args):
+            return Action(kind="finish", reason="draft saved")
+
+        def verify(self, task, observation):
+            return Verification(
+                checks=[
+                    Check(criterion="draft saved", passed=True, evidence="Draft saved indicator")
+                ]
+            )
+
+    with Harness(tmp_path, Draft(), DraftPolicy()) as h:
+        assert (
+            h.start(Task(goal="save draft only", criteria=["draft saved"]))["status"] == "completed"
+        )
+
+
+@pytest.mark.parametrize(
+    "checks",
+    [
+        [
+            Check(criterion="content", passed=False, evidence="missing"),
+            Check(criterion="sent", passed=False, evidence="pending", requires_confirmation=True),
+        ],
+        [Check(criterion="content", passed=True, evidence="visible")],
+        [
+            Check(criterion="sent", passed=True, evidence="visible"),
+            Check(criterion="sent", passed=False, evidence="pending", requires_confirmation=True),
+        ],
+        [
+            Check(
+                criterion="content", passed=False, evidence="pending", requires_confirmation=True
+            ),
+            Check(criterion="sent", passed=False, evidence="pending", requires_confirmation=True),
+        ],
+        [
+            Check(criterion="content", passed=True, evidence=""),
+            Check(criterion="sent", passed=False, evidence="pending", requires_confirmation=True),
+        ],
+        [
+            Check(criterion="content", passed=True, evidence="visible"),
+            Check(
+                criterion="sent", passed=True, evidence="contradiction", requires_confirmation=True
+            ),
+        ],
+    ],
+)
+def test_preparation_cannot_be_claimed_without_complete_consistent_evidence(checks):
+    verification = Verification(checks=checks)
+    requested = Task(goal="send", criteria=["content", "sent"])
+    assert not verification.ready_for_confirmation(requested)
+    assert not verification.satisfies(requested)

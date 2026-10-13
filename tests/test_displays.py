@@ -119,17 +119,60 @@ def test_hidden_cli_flag_is_explicit_and_settings_reject_demo_display():
         Settings(display=DisplayBinding(id=2, unique_id="virtual:test", boot_id="boot-a"))
 
 
-def test_launcher_never_moves_app_away_from_human_main_screen(monkeypatch):
+def test_launcher_never_interrupts_the_app_the_human_is_using(monkeypatch):
+    from sidecar import displays
+    from sidecar.contracts import DeviceSetupError
+
+    monkeypatch.setattr(displays, "verify", lambda *args: {})
+    # 该 App 就是主屏前台：绝不打断用户，也不清理。
+    monkeypatch.setattr(displays, "current", lambda serial, number: ("com.clock", ".Clock"))
+    calls = []
+    monkeypatch.setattr(displays, "shell", lambda *args: calls.append(args) or "")
+    binding = displays.DisplayBinding(id=2, unique_id="virtual:test", boot_id="boot-a")
+    with pytest.raises(DeviceSetupError, match="主屏"):
+        displays.launch("emulator-test", binding, "com.clock")
+    assert calls == []
+
+
+def test_launcher_stops_a_background_task_before_starting(monkeypatch):
     from sidecar import displays
 
     monkeypatch.setattr(displays, "verify", lambda *args: {})
-    monkeypatch.setattr(displays, "current", lambda *args: ("com.clock", ".Clock"))
+    # 主屏前台是别的 App，但主屏仍留着该 App 的后台 task。
+    monkeypatch.setattr(
+        displays,
+        "current",
+        lambda serial, number: ("com.other", ".Main") if number == 0 else ("com.clock", ".Clock"),
+    )
+    inventory = (
+        "RootTask id=1 bounds=[0,0][320,640] displayId=0 userId=0\n"
+        "  taskId=57: com.clock/.Clock bounds=[0,0][320,640]\n"
+    )
     calls = []
-    monkeypatch.setattr(displays, "shell", lambda *args: calls.append(args))
+    monkeypatch.setattr(displays, "shell", lambda *args: calls.append(args) or inventory)
     binding = displays.DisplayBinding(id=2, unique_id="virtual:test", boot_id="boot-a")
-    with pytest.raises(RuntimeError, match="primary"):
-        displays.launch("emulator-test", binding, "com.clock")
-    assert calls == []
+    displays.launch("emulator-test", binding, "com.clock")
+    # 先 force-stop 清掉用户的后台任务（副屏已有该 App，因此不需要 am start）。
+    assert any("force-stop" in str(entry) for entry in calls)
+    assert all("start" not in str(entry) for entry in calls)
+
+
+def test_close_app_is_quiet_when_app_is_only_on_another_display(monkeypatch):
+    from sidecar import displays
+
+    monkeypatch.setattr(displays, "verify", lambda *args: {})
+    # notion.id 只在主屏（displayId=0）；绑定的副屏没有任何它的 root task。
+    inventory = (
+        "RootTask id=1 bounds=[0,0][320,640] displayId=0 userId=0\n"
+        "  taskId=57: notion.id/notion.local.id.MainActivity\n"
+    )
+    calls = []
+    monkeypatch.setattr(displays, "shell", lambda *args: calls.append(args) or inventory)
+    binding = displays.DisplayBinding(id=95, unique_id="virtual:test", boot_id="boot-a")
+    displays.close_app("emulator-test", binding, "notion.id")  # 不应抛错
+    # 只读了一次清单，没有发出任何 stack remove。
+    assert len(calls) == 1
+    assert all("remove" not in str(entry) for entry in calls)
 
 
 def test_launcher_reuses_app_already_resumed_on_hidden_screen(monkeypatch):
@@ -141,11 +184,16 @@ def test_launcher_reuses_app_already_resumed_on_hidden_screen(monkeypatch):
         "current",
         lambda serial, number: ("com.clock" if number == 2 else "com.youtube", ".Main"),
     )
+    # 该 App 只存在于绑定的副屏（displayId=2），主屏没有它的任务。
+    inventory = (
+        "RootTask id=1 bounds=[0,0][320,640] displayId=2 userId=0\n"
+        "  taskId=57: com.clock/.Clock bounds=[0,0][320,640]\n"
+    )
     calls = []
-    monkeypatch.setattr(displays, "shell", lambda *args: calls.append(args) or "")
+    monkeypatch.setattr(displays, "shell", lambda *args: calls.append(args) or inventory)
     binding = displays.DisplayBinding(id=2, unique_id="virtual:test", boot_id="boot-a")
     displays.launch("emulator-test", binding, "com.clock")
-    assert calls == []
+    assert all("start" not in str(entry) for entry in calls)
 
 
 def test_managed_display_is_hidden_and_cleaned_up_on_caller_failure(monkeypatch):

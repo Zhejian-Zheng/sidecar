@@ -10,16 +10,31 @@ from contextlib import contextmanager
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
-from sidecar.contracts import Action, Observation
+from sidecar.contracts import Action, DeviceSetupError, Observation
 from sidecar.displays import DisplayBinding
+from sidecar.errors import ObservationError
 
 SENSITIVE = re.compile(
-    r"password|sign in|log in|verification code|pay now|purchase|remove account|"
+    r"password|sign in|log in|verification code|remove account|密码|登录|验证码|注销", re.I
+)
+CONFIRMATION = re.compile(
+    r"pay now|place order|checkout|submit order|\bbuy\b|\bpay\b|\bpurchase\b|"
     r"\bsend\b|\btransfer\b|\bpublish\b|"
-    r"密码|登录|验证码|支付|付款|购买|转账|发送|发布|注销",
+    r"支付|付款|购买|转账|发送|发布|提交订单|结算|下单|提现",
     re.I,
 )
-DESTRUCTIVE = re.compile(r"delete|删除", re.I)
+DESTRUCTIVE = re.compile(r"delete|remove|clear|erase|reset|删除|清除|清空|移除|重置", re.I)
+
+
+def overlaps(bounds, blocked):
+    left, top, right, bottom = bounds
+    return any(
+        left < blocked_right
+        and right > blocked_left
+        and top < blocked_bottom
+        and bottom > blocked_top
+        for blocked_left, blocked_top, blocked_right, blocked_bottom in blocked
+    )
 
 
 # 封装设备 RPC 子进程，避免设备调用无限阻塞主执行流程。
@@ -56,9 +71,21 @@ class Transport:
                     raise RuntimeError(
                         "Android connection failed; check ADB and device permissions"
                     )
-                return json.loads(result.stdout)
-            except (RuntimeError, subprocess.TimeoutExpired):
+                data = json.loads(result.stdout)
+                # 子进程把受控错误放在 stdout 的 error 字段，保留可读原因。
+                if isinstance(data, dict) and "error" in data:
+                    error = data["error"] or {}
+                    if "observation_stage" in error:
+                        raise ObservationError(error["observation_stage"])
+                    message = error.get("message") or "Device operation failed"
+                    if error.get("setup"):
+                        raise DeviceSetupError(message)
+                    raise RuntimeError(message)
+                return data
+            except (RuntimeError, subprocess.TimeoutExpired) as exc:
                 if attempt == attempts - 1:
+                    if op == "observe" and not isinstance(exc, ObservationError):
+                        raise ObservationError("transport") from exc
                     raise
 
 
@@ -87,6 +114,7 @@ class AndroidDevice:
         self.nodes = {}
         self.latest = None
         self.blocked_bounds = []
+        self.confirmation_bounds = []
 
     # 仅打开配置中批准的目标 App，不接受模型指定任意包名。
     def launch(self):
@@ -123,19 +151,36 @@ class AndroidDevice:
         root = ET.fromstring(data["xml"])
         nodes, lines, occurrences = {}, [], {}
         self.blocked_bounds = []
+        self.confirmation_bounds = []
         sensitive = False
         for node in root.iter("node"):
             attrs = node.attrib
             label = (attrs.get("text", "") + " " + attrs.get("content-desc", "")).strip()
             password = attrs.get("password") == "true"
-            sensitive |= password or bool(SENSITIVE.search(label))
-            bounds = [int(n) for n in re.findall(r"\d+", attrs.get("bounds", ""))]
-            valid_bounds = len(bounds) == 4 and bounds[2] > bounds[0] and bounds[3] > bounds[1]
-            if DESTRUCTIVE.search(label):
+            # resource-id 常带 submit_order / delete_btn 等语义词，一并纳入检测。
+            resource = re.sub(r"([a-z])([A-Z])", r"\1 \2", attrs.get("resource-id", ""))
+            haystack = label + " " + re.sub(r"[_/-]", " ", resource)
+            sensitive |= password or bool(SENSITIVE.search(haystack))
+            bounds = [int(n) for n in re.findall(r"-?\d+", attrs.get("bounds", ""))]
+            # 负坐标意味着节点部分离开显示区域，点击中心会落到别的控件上，直接丢弃。
+            valid_bounds = (
+                len(bounds) == 4
+                and bounds[2] > bounds[0]
+                and bounds[3] > bounds[1]
+                and bounds[0] >= 0
+                and bounds[1] >= 0
+            )
+            if DESTRUCTIVE.search(haystack):
                 if valid_bounds:
                     self.blocked_bounds.append(bounds)
                 else:
                     sensitive = True
+            # Editable content may mention sending/payment without being a submit control.
+            if "EditText" not in attrs.get("class", "") and CONFIRMATION.search(haystack):
+                if valid_bounds:
+                    self.confirmation_bounds.append(bounds)
+                else:
+                    sensitive = True  # Cannot safely isolate an unlocated submit control.
             # Do not expose credentials, including the screenshot, to the model.
             if password:
                 label = "[private input]"
@@ -177,20 +222,27 @@ class AndroidDevice:
                     description=attrs.get("content-desc", ""),
                 )
         self.nodes = nodes
+        confirmation_targets = {}
+        for key, node in nodes.items():
+            if overlaps(node["bounds"], self.confirmation_bounds):
+                node["requires_confirmation"] = True
+                confirmation_targets[key] = node["label"] or "敏感提交控件"
         context = f"App: {data['package']}\nActivity: {data.get('activity', '')}\n"
         if self.display:
             context += (
                 "Hidden display: type requires an explicit editable target; replaces its text.\n"
             )
-        # 前台既不是本任务的目标 App，也不在允许列表内时，一律交接给用户。
+        # 每个任务只操作一个目标 App：前台不是它就交接。
+        # 允许列表在构造时已校验，这里不放宽为「列表内其它 App 也可操作」。
         foreground = data["package"]
-        out_of_scope = foreground not in self.allowed or foreground != self.package
+        out_of_scope = foreground != self.package
         requires_human = sensitive or out_of_scope
         obs = Observation(
             text=(context + "\n".join(lines))[:16000],
             elements={k: json.dumps(v, ensure_ascii=False) for k, v in nodes.items()},
             image=None if requires_human else "data:image/png;base64," + data["image"],
             requires_human=requires_human,
+            confirmation_targets=confirmation_targets,
         )
         self.latest = obs
         return obs
@@ -203,20 +255,13 @@ class AndroidDevice:
             return "handoff"
         if action.target and action.target not in self.nodes:
             return "deny"
-        # 删除入口可以与普通内容共存，但仅允许不与其区域重叠的显式控件动作。
-        # 坐标、滑动、返回及无目标输入无法证明与删除无关，仍交接。
-        if self.blocked_bounds and action.kind != "wait":
+        # 删除和最终提交入口可以与普通内容共存，仅放行不与其重叠的显式控件动作。
+        # 坐标、滑动、返回及无目标输入无法可靠隔离敏感控件，仍交接。
+        if (self.blocked_bounds or self.confirmation_bounds) and action.kind != "wait":
             node = self.nodes.get(action.target)
             if not node or action.kind not in {"tap", "type"}:
                 return "handoff"
-            left, top, right, bottom = node["bounds"]
-            if any(
-                left < blocked_right
-                and right > blocked_left
-                and top < blocked_bottom
-                and bottom > blocked_top
-                for blocked_left, blocked_top, blocked_right, blocked_bottom in self.blocked_bounds
-            ):
+            if overlaps(node["bounds"], self.blocked_bounds + self.confirmation_bounds):
                 return "handoff"
         if action.kind == "type":
             node = (
