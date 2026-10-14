@@ -712,4 +712,4 @@ flowchart TD
 
 答辩时可以这样解释这项取舍：**LangGraph 管执行步骤，领域规则管任务承诺，SQLite 和锁管并发落盘。** 轻量 DDD 的收益是把取消、恢复和完成边界变得明确且容易测试，而不是增加类和层数。当前仍是单机原型；只有当多用户、多设备调度等需求实际出现后，才需要进一步扩大领域与部署边界。
 
-本次验收记录：离线全套 **412 项通过**（重构前为 331 项），新增 81 项参数化与集成测试用例；`ruff check src tests` 和本次修改的 11 个 Python 文件格式检查通过。三个真实 Android 验收文件未在本轮执行，未调用付费模型或操作演示设备。全仓格式检查仍有 android.py、test_android.py、test_browser.py、test_server.py 四个未修改文件的既有差异；不将这些差异混入架构重构。
+本次验收记录：离线全套 **412 项通过**（重构前为 331 项），新增 81 项参数化与集成测试用例；`ruff check src tests` 和本次修改的 11 个 Python 文件格式检查通过。标准测试入口复核结果为 **412 passed、3 skipped**；三个跳过项为需要显式启用的真实 Android 验收，本轮未调用付费模型或操作演示设备。全仓格式检查仍有 android.py、test_android.py、test_browser.py、test_server.py 四个未修改文件的既有差异；不将这些差异混入架构重构。
