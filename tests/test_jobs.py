@@ -560,3 +560,70 @@ def test_resume_never_clears_pending_cancel(tmp_path):
     with pytest.raises(ValueError, match="当前任务不能恢复"):
         q.resume(task_id, "已核对")
     assert q.raw(task_id)["control"] == "cancel"
+
+
+@pytest.mark.parametrize("operation", ["pause", "cancel", "clear"])
+@pytest.mark.parametrize("with_engine", [False, True])
+def test_queue_control_needs_no_agent_construction(tmp_path, monkeypatch, operation, with_engine):
+    from sidecar.harness import Harness
+    from sidecar.offline import OfflineDevice, OfflinePolicy
+    from sidecar.store import Store
+
+    q = setup(tmp_path)
+    task_id = q.submit("任务", ["一"])["id"]
+    if with_engine:
+        q.claim()
+        with q.db() as db:
+            db.execute("UPDATE jobs SET status='paused' WHERE id=?", (task_id,))
+        store = Store(q.engine)
+        store.create({"task_id": task_id, "status": "paused", "reason": ""})
+        store.close()
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("control must not construct an agent, device or model")
+
+    for cls in (Harness, OfflineDevice, OfflinePolicy):
+        monkeypatch.setattr(cls, "__init__", forbidden)
+    if operation == "clear":
+        assert q.clear() == {"cancelled": 1, "pending": 0}
+    else:
+        q.control(task_id, operation)
+    assert q.get(task_id)["status"] == ("paused" if operation == "pause" else "cancelled")
+    assert not (q.engine / "checkpoints.sqlite").exists()
+
+
+def test_clear_continues_past_completed_engine_and_closes_connections(tmp_path, monkeypatch):
+    from sidecar.store import Store
+
+    q = setup(tmp_path)
+    first = q.submit("first", ["one"])["id"]
+    second = q.submit("second", ["two"])["id"]
+    store = Store(q.engine)
+    store.create({"task_id": first, "status": "completed", "reason": "verified"})
+    store.event(first, "verification", {"evidence": "saved"})
+    store.create({"task_id": second, "status": "waiting_user", "reason": "review"})
+    store.close()
+
+    # Retain connections so CPython cannot hide a missing explicit close by GC.
+    connections = []
+    original_init = Store.__init__
+
+    def track_connection(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        connections.append(self.connection)
+
+    monkeypatch.setattr(Store, "__init__", track_connection)
+    assert q.clear() == {"cancelled": 2, "pending": 0}
+    import sqlite3
+
+    for connection in connections:
+        with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+            connection.execute("SELECT 1")
+    assert q.state(second)["status"] == "cancelled"
+    assert q.events(first)[0]["data"]["evidence"] == "saved"
+    store = Store(q.engine)
+    try:
+        store.create({"task_id": "next", "status": "running", "reason": ""})
+        assert store.get("next")["status"] == "running"
+    finally:
+        store.close()

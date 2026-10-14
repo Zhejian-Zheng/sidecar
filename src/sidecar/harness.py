@@ -25,6 +25,7 @@ from sidecar.contracts import (
     Verification,
 )
 from sidecar.errors import ObservationError, TextInputError
+from sidecar.execution_control import ExecutionControl
 from sidecar.lifecycle import TERMINAL as TERMINAL
 from sidecar.lifecycle import boundary_change, valid_resume_note
 from sidecar.store import Store
@@ -234,21 +235,7 @@ class Harness:
 
     # 提交暂停或取消请求；无人执行的遗留任务可以直接确认取消。
     def control(self, task_id, signal):
-        saved = self.store.get(task_id)
-        if saved["status"] in TERMINAL:
-            raise ValueError("task is terminal")
-        self.store.control(task_id, signal)
-        if signal == "cancel" and saved["status"] in {"paused", "waiting_user"}:
-            saved.update(status="cancelled", reason="Cancelled by user")
-            self.store.save(saved)
-        elif signal == "cancel":
-            try:
-                with self.store.execution_lock():
-                    # No executor owns the workspace: acknowledge an orphaned task.
-                    self.store.save(self.store.get(task_id))
-            except RuntimeError:
-                pass  # A live executor acknowledges at its next boundary.
-        self.store.event(task_id, "control", {"signal": signal})
+        ExecutionControl(self.store).request(task_id, signal)
 
     # 对连接故障和偶发的输出格式错误有限重试，每次尝试前检查取消、暂停和超时。
     def _model_call(self, state, call):

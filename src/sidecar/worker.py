@@ -9,8 +9,8 @@ from pathlib import Path
 
 from sidecar.contracts import ModelAPIError, Task
 from sidecar.harness import Harness
-from sidecar.lifecycle import TERMINAL
 from sidecar.jobs import JobQueue
+from sidecar.lifecycle import TERMINAL
 from sidecar.model import LangChainModel
 from sidecar.offline import PREFIX, OfflineDevice, OfflinePolicy
 from sidecar.store import Store

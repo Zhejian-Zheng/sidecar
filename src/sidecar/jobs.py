@@ -13,7 +13,7 @@ from pydantic import Field, model_validator
 
 from sidecar.contracts import Message, Task
 from sidecar.displays import DisplayBinding
-from sidecar.harness import Harness
+from sidecar.execution_control import ExecutionControl
 from sidecar.lifecycle import (
     TERMINAL,
     can_resume_queue,
@@ -22,7 +22,7 @@ from sidecar.lifecycle import (
     queue_finish,
     valid_resume_note,
 )
-from sidecar.offline import PREFIX, OfflineDevice, OfflinePolicy
+from sidecar.offline import PREFIX
 from sidecar.store import Store
 
 
@@ -285,13 +285,20 @@ class JobQueue:
             signal = control_signal(row["control"], signal)
             status = queue_control_status(row["status"], signal)
             db.execute("UPDATE jobs SET control=?, status=? WHERE id=?", (signal, status, task_id))
-        if self.state(task_id):
-            with Harness(self.engine, OfflineDevice(self.engine), OfflinePolicy()) as harness:
-                try:
-                    harness.control(task_id, signal)
-                except ValueError:
-                    pass  # Worker may have finished between the two databases.
+        self._control_engine(task_id, signal)
         return self.get(task_id)
+
+    def _control_engine(self, task_id: str, signal: str) -> None:
+        if not self.state(task_id):
+            return
+        store = Store(self.engine)
+        try:
+            try:
+                ExecutionControl(store).request(task_id, signal)
+            except ValueError:
+                pass  # Worker may have finished between the two databases.
+        finally:
+            store.close()
 
     def clear(self):
         """Cancel the current queue atomically, retaining history and executor ownership."""
@@ -303,12 +310,7 @@ class JobQueue:
             # Hold the queue transaction while signalling the engine so no new task can
             # be claimed before a saved handoff releases its workspace reservation.
             for row in rows:
-                if self.state(row["id"]):
-                    with Harness(self.engine, OfflineDevice(self.engine), OfflinePolicy()) as h:
-                        try:
-                            h.control(row["id"], "cancel")
-                        except ValueError:
-                            pass  # The engine may already have completed this task.
+                self._control_engine(row["id"], "cancel")
             db.execute(
                 "UPDATE jobs SET control='cancel', "
                 "status=CASE WHEN status='executing' THEN status ELSE 'cancelled' END, "
