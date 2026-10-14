@@ -13,9 +13,9 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict
 
 from sidecar.jobs import JobQueue
+from sidecar.lifecycle import TERMINAL as TERMINAL
 
 MODEL_ID = "sidecar-agent"
-TERMINAL = {"completed", "failed", "cancelled"}
 HANDOFF = {"waiting_user", "paused", "interrupted"}
 COMPLETION_TIMEOUT = 120
 HEARTBEAT_INTERVAL = 10
@@ -234,7 +234,8 @@ def format_result(job, *, mode=None, include_heading=True):
     if status in HANDOFF:
         if status == "paused":
             return (
-                heading + f"已暂停：{reason}\n核对画面后，请回复：继续 {job['id']}"
+                heading
+                + f"已暂停：{reason}\n核对画面后，请回复：继续 {job['id']}"
                 + f"\n放弃此任务，请回复：取消 {job['id']}"
             )
         if (state.get("observation") or {}).get("confirmation_targets") and state.get(

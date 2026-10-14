@@ -25,9 +25,10 @@ from sidecar.contracts import (
     Verification,
 )
 from sidecar.errors import ObservationError, TextInputError
+from sidecar.lifecycle import TERMINAL as TERMINAL
+from sidecar.lifecycle import boundary_change, valid_resume_note
 from sidecar.store import Store
 
-TERMINAL = {"completed", "failed", "cancelled"}
 # 敏感页面（登录、注册、验证码、支付等）一律交回用户手动完成。
 HANDOFF_REASON = "检测到需要你亲自处理的页面（登录、注册、验证码、支付等）；请手动完成后回复继续"
 
@@ -144,10 +145,8 @@ class Harness:
             return self._run(state, state)
 
     # 核对设备和任务状态，记录用户交接说明，再从新观察恢复。
-    def resume(
-        self, task_id: str, note: str, prepare: Callable[[], None] | None = None
-    ) -> dict:
-        if not note.strip() or len(note) > 1000:
+    def resume(self, task_id: str, note: str, prepare: Callable[[], None] | None = None) -> dict:
+        if not valid_resume_note(note):
             raise ValueError("resume needs a note of 1–1000 characters after reviewing the device")
         with self.store.execution_lock(), self._device_lock():
             saved = self.store.get(task_id)
@@ -275,13 +274,8 @@ class Harness:
     # 在步骤边界检查用户控制和时间预算，返回需要终止或暂停的状态。
     def _boundary(self, state):
         signal = self.store.signal(state["task_id"])
-        if signal == "cancel":
-            return {"status": "cancelled", "reason": "Cancelled by user"}
-        if signal == "pause":
-            return {"status": "paused", "reason": "Paused by user"}
-        if time.monotonic() >= self.deadline:
-            return {"status": "failed", "reason": "Run time budget exhausted"}
-        return {}
+        change = boundary_change(signal, time.monotonic() >= self.deadline)
+        return {"status": change.status, "reason": change.reason} if change else {}
 
     # 读取新界面并记录简要观察事件，截图仍保存在观察数据中。
     def _capture(self, state):

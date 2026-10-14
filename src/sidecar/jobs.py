@@ -13,7 +13,15 @@ from pydantic import Field, model_validator
 
 from sidecar.contracts import Message, Task
 from sidecar.displays import DisplayBinding
-from sidecar.harness import TERMINAL, Harness
+from sidecar.harness import Harness
+from sidecar.lifecycle import (
+    TERMINAL,
+    can_resume_queue,
+    control_signal,
+    queue_control_status,
+    queue_finish,
+    valid_resume_note,
+)
 from sidecar.offline import PREFIX, OfflineDevice, OfflinePolicy
 from sidecar.store import Store
 
@@ -240,10 +248,11 @@ class JobQueue:
             row = db.execute("SELECT status,control FROM jobs WHERE id=?", (task_id,)).fetchone()
             if not row:
                 raise KeyError("任务不存在")
-            if row["status"] in TERMINAL:
+            change = queue_finish(row["status"], row["control"], status, reason)
+            if change is None:
                 return
+            status, reason = change.status, change.reason
             if row["control"] == "cancel":
-                status, reason = "cancelled", "已取消；已执行的操作不会自动撤销"
                 # 执行器可能先完成、控制请求后到达。先同步任务索引再提交队列，
                 # 中途崩溃仍保留 executing 记录，重启可再次对账；不删除已有证据。
                 if self.state(task_id):
@@ -273,12 +282,9 @@ class JobQueue:
                 raise ValueError("任务已经结束")
             if row["control"] == "cancel":
                 return self.get(task_id)
-            db.execute("UPDATE jobs SET control=? WHERE id=?", (signal, task_id))
-            if row["status"] != "executing":
-                db.execute(
-                    "UPDATE jobs SET status=? WHERE id=?",
-                    ("cancelled" if signal == "cancel" else "paused", task_id),
-                )
+            signal = control_signal(row["control"], signal)
+            status = queue_control_status(row["status"], signal)
+            db.execute("UPDATE jobs SET control=?, status=? WHERE id=?", (signal, status, task_id))
         if self.state(task_id):
             with Harness(self.engine, OfflineDevice(self.engine), OfflinePolicy()) as harness:
                 try:
@@ -292,8 +298,7 @@ class JobQueue:
         with self.db() as db:
             db.execute("BEGIN IMMEDIATE")
             rows = db.execute(
-                "SELECT id,status FROM jobs "
-                "WHERE status NOT IN ('completed','failed','cancelled')"
+                "SELECT id,status FROM jobs WHERE status NOT IN ('completed','failed','cancelled')"
             ).fetchall()
             # Hold the queue transaction while signalling the engine so no new task can
             # be claimed before a saved handoff releases its workspace reservation.
@@ -316,14 +321,14 @@ class JobQueue:
 
     # 核对状态与备注后重新入队，等待 worker 从当前现场恢复。
     def resume(self, task_id, note):
-        if not note.strip() or len(note) > 1000:
+        if not valid_resume_note(note):
             raise ValueError("请填写核对结果，最多 1000 字")
         with self.db() as db:
             db.execute("BEGIN IMMEDIATE")
-            row = db.execute("SELECT status FROM jobs WHERE id=?", (task_id,)).fetchone()
+            row = db.execute("SELECT status,control FROM jobs WHERE id=?", (task_id,)).fetchone()
             if not row:
                 raise KeyError("任务不存在")
-            if row[0] not in {"paused", "waiting_user", "interrupted"}:
+            if not can_resume_queue(row["status"], row["control"]):
                 raise ValueError("当前任务不能恢复")
             db.execute(
                 "UPDATE jobs SET status='queued', control='', note=?, reason='' WHERE id=?",

@@ -8,7 +8,8 @@ import time
 from pathlib import Path
 
 from sidecar.contracts import ModelAPIError, Task
-from sidecar.harness import TERMINAL, Harness
+from sidecar.harness import Harness
+from sidecar.lifecycle import TERMINAL
 from sidecar.jobs import JobQueue
 from sidecar.model import LangChainModel
 from sidecar.offline import PREFIX, OfflineDevice, OfflinePolicy

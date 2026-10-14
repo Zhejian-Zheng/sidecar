@@ -17,8 +17,9 @@ def test_event_pages_are_ordered_isolated_and_skip_unrequested_payloads(tmp_path
         store.event("a", "step", {"index": 7})
         older = store.events("a", limit=3, before=latest[0]["sequence"])
         assert [event["data"]["index"] for event in older] == [1, 2, 3]
-        assert [e["data"]["index"] for e in store.events("a", limit=3,
-                before=older[0]["sequence"])] == [0]
+        assert [
+            e["data"]["index"] for e in store.events("a", limit=3, before=older[0]["sequence"])
+        ] == [0]
         with store.connection:
             store.connection.execute("UPDATE events SET payload='invalid' WHERE seq=1")
         # Proves the limit applies before decoding, not after loading all history.
@@ -34,5 +35,29 @@ def test_event_page_rejects_invalid_bounds(tmp_path, options):
         store.create({"task_id": "a", "status": "completed"})
         with pytest.raises(ValueError):
             store.events("a", **options)
+    finally:
+        store.close()
+
+
+def test_save_cancel_preserves_caller_state_and_evidence(tmp_path):
+    from copy import deepcopy
+
+    from sidecar.store import Store
+
+    store = Store(tmp_path)
+    try:
+        state = {
+            "task_id": "one",
+            "status": "running",
+            "reason": "",
+            "verification": {"checks": [{"evidence": "saved"}]},
+        }
+        store.create(state)
+        store.control("one", "cancel")
+        before = deepcopy(state)
+        saved = store.save(state)
+        assert saved["status"] == "cancelled"
+        assert state == before
+        assert saved["verification"] == before["verification"]
     finally:
         store.close()

@@ -6,6 +6,8 @@ import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
 
+from sidecar.lifecycle import TERMINAL, execution_save
+
 
 # 提供本地任务存储及工作目录执行锁，供执行者与控制入口协作。
 class Store:
@@ -57,7 +59,7 @@ class Store:
         ).fetchone():
             raise ValueError("task already exists")
         for (payload,) in self.connection.execute("SELECT payload FROM tasks"):
-            if json.loads(payload)["status"] not in {"completed", "failed", "cancelled"}:
+            if json.loads(payload)["status"] not in TERMINAL:
                 raise ValueError("unfinished task reserves this workspace; resume or cancel it")
         try:
             with self.connection:
@@ -82,8 +84,14 @@ class Store:
             # Cancellation is irreversible, including at an interrupt boundary.
             self.connection.execute("BEGIN IMMEDIATE")
             saved = self.get(state["task_id"])
-            if saved["status"] == "cancelled" or self.signal(state["task_id"]) == "cancel":
-                state = {**state, "status": "cancelled", "reason": "Cancelled by user"}
+            change = execution_save(
+                saved["status"],
+                self.signal(state["task_id"]),
+                state["status"],
+                state.get("reason", ""),
+            )
+            if change.status != state["status"] or change.reason != state.get("reason", ""):
+                state = {**state, "status": change.status, "reason": change.reason}
             self.connection.execute(
                 "UPDATE tasks SET payload=? WHERE id=?", (json.dumps(state), state["task_id"])
             )
@@ -116,8 +124,9 @@ class Store:
 
     # Fetch only the requested page in SQL, then return it in chronological order.
     # No limit preserves the existing CLI/full-history interface.
-    def events(self, task_id: str, *, limit: int | None = None,
-               before: int | None = None) -> list[dict]:
+    def events(
+        self, task_id: str, *, limit: int | None = None, before: int | None = None
+    ) -> list[dict]:
         if limit is not None and limit < 1:
             raise ValueError("limit must be positive")
         if before is not None and before < 1:

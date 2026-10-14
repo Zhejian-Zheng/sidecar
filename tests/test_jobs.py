@@ -542,10 +542,21 @@ def test_clear_queue_reaches_active_engine_before_any_device_action(tmp_path):
     with Harness(q.engine, OfflineDevice(q.engine), OfflinePolicy()) as harness:
         result = harness.start(
             Task(goal="first", criteria=["待办存在：first"]),
-            task_id=job["id"], prepare=clear_during_execution,
+            task_id=job["id"],
+            prepare=clear_during_execution,
         )
     assert result["status"] == "cancelled"
     assert OfflineDevice(q.engine).load()["items"] == []
     assert not any(event["kind"] == "action_returned" for event in q.events(job["id"]))
     q.finish(job["id"], result["status"], result["reason"])
     assert q.get(job["id"])["status"] == "cancelled"
+
+
+def test_resume_never_clears_pending_cancel(tmp_path):
+    q = setup(tmp_path)
+    task_id = q.submit("任务", ["一"])["id"]
+    with q.db() as db:
+        db.execute("UPDATE jobs SET status='paused', control='cancel' WHERE id=?", (task_id,))
+    with pytest.raises(ValueError, match="当前任务不能恢复"):
+        q.resume(task_id, "已核对")
+    assert q.raw(task_id)["control"] == "cancel"
