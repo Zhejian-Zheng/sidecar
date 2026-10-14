@@ -6,6 +6,7 @@ accepted before the queue finishes. Call these policies inside storage transacti
 """
 
 from dataclasses import dataclass
+from typing import Literal
 
 TERMINAL = frozenset({"completed", "failed", "cancelled"})
 RESUMABLE = frozenset({"paused", "waiting_user", "interrupted"})
@@ -60,3 +61,18 @@ def boundary_change(signal: str, expired: bool) -> StatusChange | None:
     if expired:
         return StatusChange("failed", "Run time budget exhausted")
     return None
+
+
+def recovery_action(
+    queue_status: str, signal: str, execution_status: str | None
+) -> Literal["finish_from_engine", "settle_engine", "cancel", "interrupt", "keep"]:
+    """Decide reconciliation, never restart a task or replay a GUI action."""
+    if execution_status in TERMINAL:
+        return "keep" if queue_status in TERMINAL else "finish_from_engine"
+    if queue_status in TERMINAL:
+        return "settle_engine" if execution_status is not None else "keep"
+    if signal == "cancel":
+        return "cancel"
+    if queue_status == "executing":
+        return "interrupt"
+    return "keep"

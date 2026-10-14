@@ -100,3 +100,30 @@ def test_boundary_controls_take_precedence_over_budget(signal, expired, status, 
 
 def test_boundary_allows_execution_without_control_or_timeout():
     assert boundary_change("", False) is None
+
+
+@pytest.mark.parametrize(
+    "queued,signal,engine,expected",
+    [
+        ("executing", "", "completed", "finish_from_engine"),
+        ("executing", "cancel", "completed", "finish_from_engine"),
+        ("paused", "", "failed", "finish_from_engine"),
+        ("completed", "", "completed", "keep"),
+        ("cancelled", "cancel", "completed", "keep"),
+        ("cancelled", "cancel", "waiting_user", "settle_engine"),
+        ("failed", "", "running", "settle_engine"),
+        ("completed", "", None, "keep"),
+        ("executing", "cancel", "running", "cancel"),
+        ("queued", "cancel", None, "cancel"),
+        ("executing", "", "running", "interrupt"),
+        ("executing", "", None, "interrupt"),
+        ("paused", "pause", "paused", "keep"),
+        ("waiting_user", "", "waiting_user", "keep"),
+        ("interrupted", "", "running", "keep"),
+        ("queued", "", None, "keep"),
+    ],
+)
+def test_recovery_decides_without_replaying_actions(queued, signal, engine, expected):
+    from sidecar.lifecycle import recovery_action
+
+    assert recovery_action(queued, signal, engine) == expected

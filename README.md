@@ -230,6 +230,8 @@ sidecar --home ~/.sidecar/android-clock cancel <任务ID>
 | 文件 | 内容 |
 | --- | --- |
 | `src/sidecar/contracts.py` | Task、Observation、Action、Verification 及设备/模型接口 |
+| `src/sidecar/lifecycle.py` | 任务生命周期、控制优先级、恢复与对账纯规则 |
+| `src/sidecar/execution_control.py` | 不依赖图、设备和模型的执行控制服务 |
 | `src/sidecar/harness.py` | LangGraph 执行、交接、恢复和验证流程 |
 | `src/sidecar/store.py` | SQLite 任务索引、控制请求、事件和动作日志 |
 | `src/sidecar/jobs.py` | 持久任务队列与执行配置 |
@@ -262,6 +264,12 @@ Android 执行锁按设备编号跨运行目录互斥；仍须避免其他自动
 - 通过实际界面证据验证结果；等待交接时，明确已经完成的部分和剩余步骤。
 
 首版建议聚焦一个用户、一个执行设备、一个第三方 App、一次一个任务。候选场景是创建清单和待办事项，具体 App 尚未确定。
+
+## 任务生命周期的轻量领域建模
+
+任务状态、取消优先级、恢复资格和重启对账决策集中在 `lifecycle.py`；`execution_control.py` 通过窄存储接口处理暂停与取消，队列不再为控制请求创建设备、模型或 LangGraph。Harness 继续负责观察与执行，Store 保留事务和执行锁。
+
+队列负责调度与最终收尾，执行索引负责运行事实和证据，图检查点负责程序恢复位置；三者不是同一份状态，也没有跨库原子事务。恢复仍需核对现场、重新观察，检查点不授权重放旧动作。数据库格式与对外接口保持兼容。具体设计、取消竞争示例与测试方法见[技术报告第 17 节](docs/technical-proposal.md#17-轻量-ddd把任务规则与执行机制分开2026-10-14)。
 
 ## Agent 架构
 

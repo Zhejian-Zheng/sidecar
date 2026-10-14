@@ -10,7 +10,7 @@ from pathlib import Path
 from sidecar.contracts import ModelAPIError, Task
 from sidecar.harness import Harness
 from sidecar.jobs import JobQueue
-from sidecar.lifecycle import TERMINAL
+from sidecar.lifecycle import TERMINAL, recovery_action
 from sidecar.model import LangChainModel
 from sidecar.offline import PREFIX, OfflineDevice, OfflinePolicy
 from sidecar.store import Store
@@ -40,21 +40,18 @@ def recover(home):
     for row in rows:
         task_id, control, status = row["id"], row["control"], row["status"]
         state = q.state(task_id)
-        if state and state["status"] in TERMINAL:
-            # 引擎已有结论：用它对齐尚未写回的队列行。
-            if status not in TERMINAL:
-                q.finish(task_id, state["status"], state["reason"])
-            continue
-        if status in TERMINAL:
-            # 队列已终态、引擎仍活着：这正是锁死工作区的组合，必须收尾引擎。
+        action = recovery_action(status, control, state["status"] if state else None)
+        if action == "finish_from_engine":
+            # Queue finish still gives an accepted cancellation priority.
+            q.finish(task_id, state["status"], state["reason"])
+        elif action == "settle_engine":
             _settle_engine(q, task_id, "队列已结束，清理遗留执行现场")
-            continue
-        if control == "cancel" or status == "cancelled":
+        elif action == "cancel":
             _settle_engine(q, task_id, "中断后已取消，不再发出新操作")
             q.finish(task_id, "cancelled", "已取消中断任务")
-        elif status == "executing":
+        elif action == "interrupt":
             q.finish(task_id, "interrupted", "执行进程中断，请核对设备后继续或取消")
-        # paused / waiting_user：保留现场，等用户核对后恢复。
+        # keep: terminal results and paused / waiting_user scenes are retained.
 
 
 # 领取一项任务，选择设备和模型，调用 Harness 后写回队列状态。

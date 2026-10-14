@@ -627,3 +627,51 @@ def test_clear_continues_past_completed_engine_and_closes_connections(tmp_path, 
         assert store.get("next")["status"] == "running"
     finally:
         store.close()
+
+
+@pytest.mark.parametrize(
+    "queue_status,control,engine_status,expected_queue,expected_engine",
+    [
+        ("executing", "", "running", "interrupted", "running"),
+        ("executing", "", None, "interrupted", None),
+        ("paused", "pause", "paused", "paused", "paused"),
+        ("waiting_user", "", "waiting_user", "waiting_user", "waiting_user"),
+        ("cancelled", "cancel", "waiting_user", "cancelled", "cancelled"),
+        ("executing", "cancel", "completed", "cancelled", "cancelled"),
+    ],
+)
+def test_recovery_is_repeatable_without_actions(
+    tmp_path, monkeypatch, queue_status, control, engine_status, expected_queue, expected_engine
+):
+    from copy import deepcopy
+
+    from sidecar.offline import OfflineDevice
+    from sidecar.store import Store
+    from sidecar.worker import recover
+
+    q = setup(tmp_path)
+    task_id = q.submit("task", ["item"])["id"]
+    with q.db() as db:
+        db.execute(
+            "UPDATE jobs SET status=?,control=? WHERE id=?", (queue_status, control, task_id)
+        )
+    # Old persisted payload shape: no new domain class or schema marker required.
+    if engine_status:
+        store = Store(q.engine)
+        try:
+            store.create({"task_id": task_id, "status": engine_status, "reason": "saved"})
+        finally:
+            store.close()
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("recovery must not execute device actions")
+
+    monkeypatch.setattr(OfflineDevice, "execute", forbidden)
+    recover(tmp_path)
+    first = deepcopy(q.get(task_id))
+    events = q.events(task_id)
+    recover(tmp_path)
+    assert q.get(task_id) == first
+    assert q.events(task_id) == events
+    assert first["status"] == expected_queue
+    assert (first["state"]["status"] if first["state"] else None) == expected_engine
