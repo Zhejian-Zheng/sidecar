@@ -3,6 +3,7 @@
 
 import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
@@ -12,10 +13,13 @@ from xml.etree import ElementTree as ET
 
 from sidecar.contracts import Action, DeviceSetupError, Observation
 from sidecar.displays import DisplayBinding
-from sidecar.errors import ObservationError
+from sidecar.errors import ObservationError, TextInputError
 
 SENSITIVE = re.compile(
-    r"password|sign in|log in|verification code|remove account|密码|登录|验证码|注销", re.I
+    r"password|sign in|log in|sign up|\bregister\b|create account|create an account|"
+    r"new account|verification code|remove account|"
+    r"密码|登录|注册|验证码|注销|创建账号|创建账户|新用户",
+    re.I,
 )
 CONFIRMATION = re.compile(
     r"pay now|place order|checkout|submit order|\bbuy\b|\bpay\b|\bpurchase\b|"
@@ -35,6 +39,16 @@ def overlaps(bounds, blocked):
         and bottom > blocked_top
         for blocked_left, blocked_top, blocked_right, blocked_bottom in blocked
     )
+
+
+# Device RPC needs runtime/ADB configuration, never provider credentials.
+DEVICE_ENV_KEYS = {
+    "PATH", "HOME", "USER", "LOGNAME", "TMPDIR", "TMP", "TEMP",
+    "LANG", "LC_ALL", "LC_CTYPE", "SYSTEMROOT", "WINDIR",
+    "PYTHONPATH", "VIRTUAL_ENV", "ANDROID_HOME", "ANDROID_SDK_ROOT",
+    "ANDROID_USER_HOME", "ANDROID_ADB_SERVER_PORT", "ADB_SERVER_SOCKET",
+    "ADB_VENDOR_KEYS",
+}
 
 
 # 封装设备 RPC 子进程，避免设备调用无限阻塞主执行流程。
@@ -63,6 +77,8 @@ class Transport:
                             "package": self.package,
                         }
                     ),
+                    env={key: value for key, value in os.environ.items()
+                         if key in DEVICE_ENV_KEYS},
                     capture_output=True,
                     text=True,
                     timeout=30,
@@ -75,6 +91,8 @@ class Transport:
                 # 子进程把受控错误放在 stdout 的 error 字段，保留可读原因。
                 if isinstance(data, dict) and "error" in data:
                     error = data["error"] or {}
+                    if "text_input_stage" in error:
+                        raise TextInputError(error["text_input_stage"])
                     if "observation_stage" in error:
                         raise ObservationError(error["observation_stage"])
                     message = error.get("message") or "Device operation failed"
@@ -82,8 +100,14 @@ class Transport:
                         raise DeviceSetupError(message)
                     raise RuntimeError(message)
                 return data
-            except (RuntimeError, subprocess.TimeoutExpired) as exc:
+            except (RuntimeError, subprocess.TimeoutExpired, ValueError, OSError) as exc:
                 if attempt == attempts - 1:
+                    if (
+                        op == "execute"
+                        and (payload or {}).get("kind") == "type"
+                        and not isinstance(exc, TextInputError)
+                    ):
+                        raise TextInputError("transport") from exc
                     if op == "observe" and not isinstance(exc, ObservationError):
                         raise ObservationError("transport") from exc
                     raise
@@ -115,6 +139,9 @@ class AndroidDevice:
         self.latest = None
         self.blocked_bounds = []
         self.confirmation_bounds = []
+        self.protected_click_bounds = []
+        self.width = None
+        self.height = None
 
     # 仅打开配置中批准的目标 App，不接受模型指定任意包名。
     def launch(self):
@@ -152,6 +179,7 @@ class AndroidDevice:
         nodes, lines, occurrences = {}, [], {}
         self.blocked_bounds = []
         self.confirmation_bounds = []
+        clickable_bounds = []
         sensitive = False
         for node in root.iter("node"):
             attrs = node.attrib
@@ -170,6 +198,9 @@ class AndroidDevice:
                 and bounds[0] >= 0
                 and bounds[1] >= 0
             )
+            # Scan all clickable parents, including those outside the model's element limit.
+            if valid_bounds and attrs.get("clickable") == "true":
+                clickable_bounds.append(bounds)
             if DESTRUCTIVE.search(haystack):
                 if valid_bounds:
                     self.blocked_bounds.append(bounds)
@@ -222,6 +253,10 @@ class AndroidDevice:
                     description=attrs.get("content-desc", ""),
                 )
         self.nodes = nodes
+        sensitive_bounds = self.blocked_bounds + self.confirmation_bounds
+        self.protected_click_bounds = sensitive_bounds + [
+            bounds for bounds in clickable_bounds if overlaps(bounds, sensitive_bounds)
+        ]
         confirmation_targets = {}
         for key, node in nodes.items():
             if overlaps(node["bounds"], self.confirmation_bounds):
@@ -234,6 +269,9 @@ class AndroidDevice:
             )
         # 每个任务只操作一个目标 App：前台不是它就交接。
         # 允许列表在构造时已校验，这里不放宽为「列表内其它 App 也可操作」。
+        # 记录屏幕尺寸，供 assess 把归一化坐标换算成像素落点。
+        self.width = data.get("width")
+        self.height = data.get("height")
         foreground = data["package"]
         out_of_scope = foreground != self.package
         requires_human = sensitive or out_of_scope
@@ -247,6 +285,12 @@ class AndroidDevice:
         self.latest = obs
         return obs
 
+    # 把 0–1 的归一化坐标换算为像素落点；缺少屏幕尺寸时返回 None。
+    def pixel_point(self, x, y):
+        if x is None or y is None or not self.width or not self.height:
+            return None
+        return int(x * self.width), int(y * self.height)
+
     # 检查交接标记、目标控件和输入焦点，决定是否允许执行。
     def assess(self, action, observation):
         if observation.requires_human:
@@ -255,13 +299,31 @@ class AndroidDevice:
             return "handoff"
         if action.target and action.target not in self.nodes:
             return "deny"
-        # 删除和最终提交入口可以与普通内容共存，仅放行不与其重叠的显式控件动作。
-        # 坐标、滑动、返回及无目标输入无法可靠隔离敏感控件，仍交接。
-        if (self.blocked_bounds or self.confirmation_bounds) and action.kind != "wait":
-            node = self.nodes.get(action.target)
-            if not node or action.kind not in {"tap", "type"}:
-                return "handoff"
-            if overlaps(node["bounds"], self.blocked_bounds + self.confirmation_bounds):
+        if action.target and overlaps(
+            self.nodes[action.target]["bounds"], self.blocked_bounds + self.confirmation_bounds
+        ):
+            return "handoff"
+        # 目标控件按区域重叠检查；坐标点击还要保护敏感标签所属的可点击父控件。
+        # wait 和 back 沿用导航策略，不作为控件点击处理。
+        if (self.blocked_bounds or self.confirmation_bounds) and action.kind not in {
+            "wait",
+            "back",
+        }:
+            sensitive = self.blocked_bounds + self.confirmation_bounds
+            if action.kind == "tap" and action.target is None:
+                # A child label can belong to a larger clickable submission control.
+                sensitive = self.protected_click_bounds
+                point = self.pixel_point(action.x, action.y)
+            else:
+                node = self.nodes.get(action.target)
+                if not node or action.kind not in {"tap", "type"}:
+                    return "handoff"
+                left, top, right, bottom = node["bounds"]
+                point = ((left + right) // 2, (top + bottom) // 2)
+            if point is None or any(
+                left <= point[0] <= right and top <= point[1] <= bottom
+                for left, top, right, bottom in sensitive
+            ):
                 return "handoff"
         if action.kind == "type":
             node = (

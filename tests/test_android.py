@@ -59,6 +59,17 @@ def test_android_blocks_wrong_app_and_password_screens():
     assert d.observe().requires_human
 
 
+@pytest.mark.parametrize(
+    "label",
+    ["Sign up", "Register", "Create account", "注册", "创建账号", "Sign in", "登录"],
+)
+def test_sign_in_and_sign_up_entries_always_hand_off(label):
+    """登录/注册入口必须自动中断，交回用户手动完成。"""
+    d, t = device()
+    t.xml = XML.replace('text="保存"', f'text="{label}"')
+    assert d.observe().requires_human
+
+
 def test_android_target_freshness_ignores_image_but_not_changed_button():
     d, t = device()
     before = d.observe()
@@ -196,7 +207,7 @@ def test_android_allows_preparation_but_blocks_final_action(label):
     assert t.actions == []
 
 
-def test_confirmation_control_blocks_overlapping_parent_and_coordinate_bypass():
+def test_confirmation_control_blocks_overlapping_target_and_inside_coordinates():
     d, t = device()
     t.xml = XML.replace('text="保存"', 'text="Send"').replace(
         "</hierarchy>",
@@ -205,13 +216,16 @@ def test_confirmation_control_blocks_overlapping_parent_and_coordinate_bypass():
     )
     obs = d.observe()
     parent = next(k for k, v in obs.elements.items() if "parent" in v)
+    # 与敏感入口重叠的控件、落点在敏感区域内的坐标、以及无法隔离的动作，都要交接。
     for action in [
         Action(kind="tap", target=parent, reason="parent"),
-        Action(kind="tap", x=0.5, y=0.5, reason="coordinate"),
+        Action(kind="tap", x=0.5, y=0.25, reason="inside Send"),
         Action(kind="type", text="test", reason="focused"),
         Action(kind="swipe", direction="left", reason="swipe"),
     ]:
         assert d.assess(action, obs) == "handoff"
+    # 落点远离敏感入口的坐标点击放行；否则「点击正文区域」这类任务永远无法完成。
+    assert d.assess(Action(kind="tap", x=0.5, y=0.9, reason="safe"), obs) == "allow"
 
 
 def test_draft_text_with_send_word_is_not_a_submission_control():
@@ -242,6 +256,23 @@ def test_send_button_does_not_block_safe_draft_navigation():
     obs = d.observe()
     target = next(k for k, v in obs.elements.items() if "Navigate up" in v)
     assert d.assess(Action(kind="tap", target=target, reason="save draft"), obs) == "allow"
+
+
+@pytest.mark.parametrize("label", ["Send", "Pay now", "Delete"])
+@pytest.mark.parametrize("coordinates", [False, True])
+def test_sensitive_child_protects_entire_clickable_parent(label, coordinates):
+    d, t = device()
+    t.xml = ('<hierarchy><node package="com.example.todo" class="Button" clickable="true" '
+             'bounds="[0,0][200,200]"><node text="' + label + '" '
+             'bounds="[0,0][20,20]"/></node></hierarchy>')
+    obs = d.observe()
+    action = Action(kind="tap", reason="parent", **(
+        {"x": 0.5, "y": 0.25} if coordinates else {"target": next(iter(obs.elements))}
+    ))
+    assert d.assess(action, obs) == "handoff"
+    with pytest.raises(ValueError):
+        d.execute(action)
+    assert not t.actions
 
 
 def test_harness_fills_content_then_hands_off_without_sending(tmp_path):
@@ -298,7 +329,7 @@ def test_harness_fills_content_then_hands_off_without_sending(tmp_path):
         assert [payload["kind"] for op, payload in transport.actions] == ["type"]
 
 
-def test_final_control_after_element_limit_still_blocks_coordinate_actions():
+def test_control_after_element_limit_still_protects_its_own_region():
     d, t = device()
     field = (
         '<node package="com.example.todo" class="Button" text="ordinary" '
@@ -309,7 +340,10 @@ def test_final_control_after_element_limit_still_blocks_coordinate_actions():
     )
     obs = d.observe()
     assert not obs.requires_human
-    assert d.assess(Action(kind="tap", x=0.5, y=0.5, reason="coordinate"), obs) == "handoff"
+    # 敏感入口即使超出交给模型的 200 个元素，其区域仍被完整收集：落点在其内要交接。
+    assert d.assess(Action(kind="tap", x=0.05, y=0.025, reason="inside Pay now"), obs) == "handoff"
+    # 远离敏感区域的落点放行。
+    assert d.assess(Action(kind="tap", x=0.5, y=0.5, reason="safe"), obs) == "allow"
 
 
 def test_delete_button_does_not_block_reading_or_separate_safe_target():
@@ -506,3 +540,76 @@ def test_transport_hides_uncontrolled_error_message(monkeypatch):
     monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: Result())
     with pytest.raises(RuntimeError, match="RuntimeError"):
         Transport("emulator-test").call("close_app")
+
+
+@pytest.mark.parametrize("stage", ["target", "verification", "private-secret"])
+def test_text_error_survives_rpc_without_exposing_details(monkeypatch, capsys, stage):
+    from types import SimpleNamespace
+
+    from sidecar import android_rpc
+    from sidecar.android import Transport
+    from sidecar.errors import TextInputError
+
+    def fail():
+        raise TextInputError(stage)
+
+    monkeypatch.setattr(android_rpc, "run", fail)
+    android_rpc.main()
+    wire = capsys.readouterr().out
+    monkeypatch.setattr(
+        "sidecar.android.subprocess.run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout=wire),
+    )
+    with pytest.raises(TextInputError) as caught:
+        Transport("emulator-test").call("execute", {"kind": "type", "text": "private-body"})
+    assert caught.value.stage == ("unknown" if stage == "private-secret" else stage)
+    assert "private" not in str(caught.value)
+    assert "private" not in wire
+
+
+def test_text_transport_timeout_is_classified_without_replay(monkeypatch):
+    import subprocess
+
+    from sidecar.android import Transport
+    from sidecar.errors import TextInputError
+
+    calls = []
+
+    def timeout(*args, **kwargs):
+        calls.append(1)
+        raise subprocess.TimeoutExpired("private-command", 30)
+
+    monkeypatch.setattr("sidecar.android.subprocess.run", timeout)
+    with pytest.raises(TextInputError) as caught:
+        Transport("emulator-test").call("execute", {"kind": "type", "text": "private-body"})
+    assert caught.value.stage == "transport"
+    assert len(calls) == 1
+    assert "private" not in str(caught.value)
+
+
+def test_device_subprocess_receives_adb_config_but_not_model_credentials(monkeypatch):
+    import subprocess
+    import sys
+
+    from sidecar.android import Transport as DeviceTransport
+
+    monkeypatch.setenv("SIDECAR_API_KEY", "test-model-secret")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-provider-secret")
+    monkeypatch.setenv("UNRELATED_PRIVATE_VALUE", "test-private")
+    monkeypatch.setenv("ADB_SERVER_SOCKET", "tcp:localhost:5037")
+    run = subprocess.run
+
+    def probe_environment(command, **kwargs):
+        # Replace only the device entrypoint; still launch a real child process.
+        probe = (
+            "import os,json; print(json.dumps({"
+            "'leaked': any(k in os.environ for k in "
+            "['SIDECAR_API_KEY','OPENAI_API_KEY','UNRELATED_PRIVATE_VALUE']),"
+            "'adb': os.environ.get('ADB_SERVER_SOCKET'),"
+            "'path': bool(os.environ.get('PATH'))}))"
+        )
+        return run([sys.executable, "-c", probe], **kwargs)
+
+    monkeypatch.setattr("sidecar.android.subprocess.run", probe_environment)
+    result = DeviceTransport("test-device").call("observe")
+    assert result == {"leaked": False, "adb": "tcp:localhost:5037", "path": True}

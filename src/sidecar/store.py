@@ -23,6 +23,7 @@ class Store:
                 seq INTEGER PRIMARY KEY, task TEXT NOT NULL, kind TEXT NOT NULL,
                 payload TEXT NOT NULL, at TEXT DEFAULT CURRENT_TIMESTAMP
             );
+            CREATE INDEX IF NOT EXISTS events_task_seq ON events(task, seq);
             CREATE TABLE IF NOT EXISTS actions (
                 id TEXT PRIMARY KEY, task TEXT NOT NULL, payload TEXT NOT NULL,
                 outcome TEXT NOT NULL DEFAULT 'started'
@@ -113,14 +114,28 @@ class Store:
                 (task_id, kind, json.dumps(payload)),
             )
 
-    # 按递增序号返回事件，将数据库中的 JSON 转回对象。
-    def events(self, task_id: str) -> list[dict]:
+    # Fetch only the requested page in SQL, then return it in chronological order.
+    # No limit preserves the existing CLI/full-history interface.
+    def events(self, task_id: str, *, limit: int | None = None,
+               before: int | None = None) -> list[dict]:
+        if limit is not None and limit < 1:
+            raise ValueError("limit must be positive")
+        if before is not None and before < 1:
+            raise ValueError("before must be positive")
         self.get(task_id)
+        query = "SELECT seq,kind,payload,at FROM events WHERE task=?"
+        params = [task_id]
+        if before is not None:
+            query += " AND seq < ?"
+            params.append(before)
+        query += " ORDER BY seq DESC"
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(limit)
+        rows = self.connection.execute(query, params).fetchall()
         return [
             {"sequence": r[0], "kind": r[1], "data": json.loads(r[2]), "at": r[3]}
-            for r in self.connection.execute(
-                "SELECT seq,kind,payload,at FROM events WHERE task=? ORDER BY seq", (task_id,)
-            )
+            for r in reversed(rows)
         ]
 
     # 在设备动作前登记唯一意图；重复编号返回 False，阻止重复执行。

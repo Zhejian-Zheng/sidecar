@@ -58,3 +58,30 @@ def test_config_exposes_allow_list_and_task_app_is_validated(tmp_path):
         accepted = c.post("/api/tasks", headers=headers, json={"goal": "任务", "app": "com.b"})
         assert accepted.status_code == 201
         assert accepted.json()["request"]["app"] == "com.b"
+
+
+def test_event_history_pagination_requires_auth_and_validates_cursor(tmp_path):
+    from sidecar.jobs import JobQueue
+    from sidecar.store import Store
+
+    q = JobQueue(tmp_path)
+    task_id = q.submit("任务", items=["一"])["id"]
+    store = Store(q.engine)
+    try:
+        store.create({"task_id": task_id, "status": "completed"})
+        for i in range(65):
+            store.event(task_id, "step", {"index": i})
+    finally:
+        store.close()
+    headers = {"Authorization": "Bearer test-pairing-secret"}
+    url = f"/api/tasks/{task_id}/events"
+    with client(tmp_path) as c:
+        assert c.get(url).status_code == 401
+        latest = c.get(url, headers=headers).json()
+        assert len(latest) == 60
+        assert latest[0]["data"]["index"] == 5
+        older = c.get(url, headers=headers, params={"before": latest[0]["sequence"]}).json()
+        assert [e["data"]["index"] for e in older] == [0, 1, 2, 3, 4]
+        assert c.get(url, headers=headers, params={"limit": 501}).status_code == 422
+        assert c.get(url, headers=headers, params={"before": 0}).status_code == 422
+        assert c.get('/api/tasks/missing/events', headers=headers).status_code == 404

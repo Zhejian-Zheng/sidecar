@@ -191,8 +191,24 @@ class JobQueue:
         row["state"] = state
         if row["status"] == "executing" and state:
             row["status"], row["reason"] = state["status"], state["reason"]
-        if row["control"] and row["status"] not in TERMINAL:
+        # Keep the control mailbox intact, but do not report an acknowledged pause as pending.
+        if (
+            row["control"]
+            and row["status"] not in TERMINAL
+            and not (row["control"] == "pause" and row["status"] == "paused")
+        ):
             row["pending_control"] = row["control"]
+        if row["status"] == "queued":
+            with self.db() as db:
+                blocker = db.execute(
+                    "SELECT id,status FROM jobs WHERE id != ? AND "
+                    "(status NOT IN ('queued','completed','failed','cancelled') "
+                    "OR (status='queued' AND seq < ?)) "
+                    "ORDER BY CASE WHEN status='queued' THEN 1 ELSE 0 END, seq LIMIT 1",
+                    (task_id, row["seq"]),
+                ).fetchone()
+            if blocker:
+                row["blocked_by"] = dict(blocker)
         return row
 
     # 按创建顺序倒序返回最近五十项任务及其当前状态。
@@ -271,6 +287,33 @@ class JobQueue:
                     pass  # Worker may have finished between the two databases.
         return self.get(task_id)
 
+    def clear(self):
+        """Cancel the current queue atomically, retaining history and executor ownership."""
+        with self.db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            rows = db.execute(
+                "SELECT id,status FROM jobs "
+                "WHERE status NOT IN ('completed','failed','cancelled')"
+            ).fetchall()
+            # Hold the queue transaction while signalling the engine so no new task can
+            # be claimed before a saved handoff releases its workspace reservation.
+            for row in rows:
+                if self.state(row["id"]):
+                    with Harness(self.engine, OfflineDevice(self.engine), OfflinePolicy()) as h:
+                        try:
+                            h.control(row["id"], "cancel")
+                        except ValueError:
+                            pass  # The engine may already have completed this task.
+            db.execute(
+                "UPDATE jobs SET control='cancel', "
+                "status=CASE WHEN status='executing' THEN status ELSE 'cancelled' END, "
+                "reason=CASE WHEN status='executing' THEN reason "
+                "ELSE '已取消；已执行的操作不会自动撤销' END "
+                "WHERE status NOT IN ('completed','failed','cancelled')"
+            )
+        pending = sum(row["status"] == "executing" for row in rows)
+        return {"cancelled": len(rows) - pending, "pending": pending}
+
     # 核对状态与备注后重新入队，等待 worker 从当前现场恢复。
     def resume(self, task_id, note):
         if not note.strip() or len(note) > 1000:
@@ -289,12 +332,12 @@ class JobQueue:
         return self.get(task_id)
 
     # 读取任务最近六十条执行事件，供页面展示。
-    def events(self, task_id):
+    def events(self, task_id, *, limit=60, before=None):
         self.raw(task_id)
         if not self.state(task_id):
             return []
         store = Store(self.engine)
         try:
-            return store.events(task_id)[-60:]
+            return store.events(task_id, limit=limit, before=before)
         finally:
             store.close()

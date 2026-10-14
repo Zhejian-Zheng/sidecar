@@ -249,8 +249,19 @@ def test_offline_cancel_releases_queue_after_hidden_server_dies(tmp_path, monkey
     assert "cancel" in capsys.readouterr().out
 
 
-@pytest.mark.parametrize("response", [b'{"ok":false}', b'{"ok":true,"verified":false}'])
-def test_text_bridge_rejects_unverified_result_without_replay(monkeypatch, response):
+@pytest.mark.parametrize(
+    "response,stage",
+    [
+        (b'{"ok":false}', "unknown"),
+        (b'{"ok":true,"verified":false}', "verification"),
+        (b'{"ok":false,"stage":"write_rejected"}', "write_rejected"),
+        (b'{"ok":false,"stage":"target"}', "target"),
+        (b'{"ok":false,"stage":"private-secret"}', "unknown"),
+        (b"private-secret", "protocol"),
+        (b"[]", "protocol"),
+    ],
+)
+def test_text_bridge_rejects_unverified_result_without_replay(monkeypatch, response, stage):
     from sidecar import displays
 
     monkeypatch.setattr(displays, "verify", lambda *args: {})
@@ -265,7 +276,7 @@ def test_text_bridge_rejects_unverified_result_without_replay(monkeypatch, respo
     monkeypatch.setattr(displays.subprocess, "run", lambda *a, **kw: None)
     monkeypatch.setattr(displays, "run", run)
     binding = displays.DisplayBinding(id=2, unique_id="virtual:test", boot_id="boot-a")
-    with pytest.raises(RuntimeError):
+    with pytest.raises(RuntimeError) as caught:
         displays.set_text(
             "emulator-test",
             binding,
@@ -282,6 +293,8 @@ def test_text_bridge_rejects_unverified_result_without_replay(monkeypatch, respo
             },
         )
     assert len(writes) == 1
+    assert getattr(caught.value, "stage", None) == stage
+    assert "private-secret" not in str(caught.value)
 
 
 def test_close_app_removes_only_its_secondary_stack(monkeypatch):

@@ -630,3 +630,188 @@ def test_chat_retry_keeps_original_target_after_app_configuration_changes(tmp_pa
     assert retry["id"] == first["id"]
     assert retry["request"]["app"] == "com.a"
     assert len(q.list()) == 1
+
+
+@pytest.mark.parametrize(
+    "template,expected",
+    [
+        ("取消 Gmail 的任务{id}", "cancelled"),
+        ("停止任务 {id}", "cancelled"),
+        ("请暂停任务：{id}", "paused"),
+        ("恢复任务{id}", "queued"),
+        ("查看任务{id}的进度", "paused"),
+        ("状态 {id}", "paused"),
+    ],
+)
+def test_chat_control_aliases(tmp_path, template, expected):
+    q = JobQueue(tmp_path)
+    job = q.submit("原任务", items=["原任务"])
+    q.control(job["id"], "pause")
+    result, _ = openai_compat.prepare_completion(q, template.format(id=job["id"]))
+    assert result["id"] == job["id"]
+    assert q.get(job["id"])["status"] == expected
+    assert len(q.list()) == 1
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize(
+    "command", ["帮助", "任务列表", "查看队列", "取消任务", "取消 " + "a" * 32 + " " + "b" * 32]
+)
+def test_chat_information_never_submits(tmp_path, immediate_timeout, monkeypatch, stream, command):
+    monkeypatch.setattr(openai_compat, "COMPLETION_TIMEOUT", 0)
+    with client(tmp_path) as c:
+        response = chat(c, command, stream=stream)
+    assert response.status_code == 200
+    content = (
+        stream_text(stream_chunks(response))
+        if stream
+        else response.json()["choices"][0]["message"]["content"]
+    )
+    assert content
+    assert JobQueue(tmp_path).list() == []
+
+
+def test_queued_result_identifies_blocking_handoff(tmp_path):
+    q = JobQueue(tmp_path)
+    first = q.submit("first", items=["first"])
+    q.finish(first["id"], "waiting_user", "check input")
+    second = q.submit("second", items=["second"])
+    result, wait = openai_compat.prepare_completion(q, "查询 " + second["id"])
+    text = format_result(result)
+    assert not wait
+    assert "等待执行" in text and "仍在执行中" not in text
+    assert first["id"] in text
+    assert "取消 " + first["id"] in text
+
+
+@pytest.mark.parametrize("template", ["不要取消 {id}", "请解释“取消 {id}”", "取消 {id} 不要执行"])
+def test_negated_and_quoted_cancel_does_not_control(tmp_path, template):
+    q = JobQueue(tmp_path)
+    job = q.submit("original", items=["original"])
+    openai_compat.prepare_completion(q, template.format(id=job["id"]))
+    assert q.get(job["id"])["status"] == "queued"
+
+
+@pytest.mark.parametrize("template", ["取消任务{id}的进度", "取消不要停止的任务{id}"])
+def test_ambiguous_control_does_not_mutate_queue(tmp_path, template):
+    q = JobQueue(tmp_path)
+    job = q.submit("original", items=["original"])
+    openai_compat.prepare_completion(q, template.format(id=job["id"]))
+    assert q.get(job["id"])["status"] == "queued"
+    assert len(q.list()) == 1
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_cancel_through_http_is_idempotent(tmp_path, stream):
+    q = JobQueue(tmp_path)
+    job = q.submit("original", items=["original"])
+    with client(tmp_path) as c:
+        for _ in range(2):
+            response = chat(c, "取消 gamil 的任务" + job["id"], stream=stream)
+            text = (
+                stream_text(stream_chunks(response))
+                if stream
+                else response.json()["choices"][0]["message"]["content"]
+            )
+            assert "已取消" in text
+    assert q.get(job["id"])["status"] == "cancelled"
+    assert len(q.list()) == 1
+
+
+def test_chat_queue_lists_blocker_without_modification(tmp_path):
+    q = JobQueue(tmp_path)
+    first = q.submit("first", items=["first"])
+    q.control(first["id"], "pause")
+    second = q.submit("second", items=["second"])
+    result, wait = openai_compat.prepare_completion(q, "查看队列")
+    text = format_result(result)
+    assert not wait
+    assert first["id"] in text and second["id"] in text
+    assert "已暂停" in text and "等待执行" in text
+    assert q.get(first["id"])["status"] == "paused"
+    assert q.get(second["id"])["status"] == "queued"
+
+
+@pytest.mark.parametrize(
+    "goal",
+    ["查看 Gmail 中关于任务分配的邮件", "查询今天的任务安排", "查看任务安排"],
+)
+def test_normal_goals_mentioning_tasks_are_submitted(tmp_path, goal):
+    q = JobQueue(tmp_path)
+    job, wait = openai_compat.prepare_completion(q, goal)
+    assert wait
+    assert job["status"] == "queued"
+    assert q.get(job["id"])["request"]["goal"] == goal
+    assert len(q.list()) == 1
+
+
+@pytest.mark.parametrize(
+    "command", ["暂停", "取消任务", "请查看任务编号：abc123", "取消 Gmail 的任务"]
+)
+def test_incomplete_queue_commands_still_do_not_submit(tmp_path, command):
+    q = JobQueue(tmp_path)
+    job, wait = openai_compat.prepare_completion(q, command)
+    assert not wait
+    assert job["status"] == "information"
+    assert q.list() == []
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_acknowledged_pause_reports_resume_instructions(tmp_path, stream):
+    q = JobQueue(tmp_path)
+    job = q.submit("original", items=["original"])
+    with client(tmp_path) as c:
+        for command in ("暂停 ", "查询 "):
+            response = chat(c, command + job["id"], stream=stream)
+            text = (
+                stream_text(stream_chunks(response))
+                if stream
+                else response.json()["choices"][0]["message"]["content"]
+            )
+            assert "已暂停" in text
+            assert "等待当前操作结束" not in text
+            assert "继续 " + job["id"] in text
+    assert "pending_control" not in q.get(job["id"])
+    assert q.claim() is None
+
+
+def test_unacknowledged_pause_remains_pending_until_worker_finishes(tmp_path):
+    q = JobQueue(tmp_path)
+    job = q.submit("original", items=["original"])
+    q.claim()
+    pending = q.control(job["id"], "pause")
+    assert pending["pending_control"] == "pause"
+    assert "等待当前操作结束" in format_result(pending)
+    q.finish(job["id"], "paused", "Paused by user")
+    paused = q.get(job["id"])
+    assert "pending_control" not in paused
+    assert "继续 " + job["id"] in format_result(paused)
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("command", ["清空队列", "清除任务队列"])
+def test_chat_clear_queue_cancels_without_creating_tasks(
+    tmp_path, stream, command, immediate_timeout, monkeypatch
+):
+    monkeypatch.setattr(openai_compat, "COMPLETION_TIMEOUT", 0)
+    q = JobQueue(tmp_path)
+    jobs = [q.submit(str(i), items=[str(i)]) for i in range(2)]
+    with client(tmp_path) as c:
+        response = chat(c, command, stream=stream)
+    assert response.status_code == 200
+    text = (
+        stream_text(stream_chunks(response))
+        if stream
+        else response.json()["choices"][0]["message"]["content"]
+    )
+    assert "已取消 2" in text
+    assert len(q.list()) == 2
+    assert all(q.get(job["id"])["status"] == "cancelled" for job in jobs)
+
+
+@pytest.mark.parametrize("goal", ["不要清空队列", "解释一下“清空队列”", "清空队列后做什么"])
+def test_embedded_clear_command_does_not_cancel_existing_tasks(tmp_path, goal):
+    q = JobQueue(tmp_path)
+    job = q.submit("original", items=["original"])
+    openai_compat.prepare_completion(q, goal)
+    assert q.get(job["id"])["status"] == "queued"

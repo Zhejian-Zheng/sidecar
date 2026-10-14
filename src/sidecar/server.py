@@ -8,7 +8,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import Field
@@ -150,6 +150,15 @@ def create_app(home, token=None):
             result["state"] = {k: v for k, v in result["state"].items() if k != "observation"}
         result["events"] = q.events(task_id)
         return result
+
+    # Stable cursor pagination: use the first sequence in a page to request older events.
+    @app.get("/api/tasks/{task_id}/events", dependencies=[Depends(authenticate)])
+    def events(
+        task_id: str,
+        limit: int = Query(default=60, ge=1, le=500),
+        before: int | None = Query(default=None, ge=1),
+    ):
+        return q.events(task_id, limit=limit, before=before)
 
     # 读取最近观察的图片；无图片时返回 204，这不是连续视频流。
     @app.get("/api/tasks/{task_id}/frame", dependencies=[Depends(authenticate)])

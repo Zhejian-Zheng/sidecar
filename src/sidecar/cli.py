@@ -37,6 +37,10 @@ def parser():
     for name in ("status", "events", "pause", "cancel"):
         commands.add_parser(name).add_argument("task_id")
     commands.add_parser("demo-login", help="Simulate the user logging in; no real account involved")
+    commands.add_parser("clear-queue", help="Cancel all unfinished queue tasks; retain history")
+    export = commands.add_parser("export", help="Export local task evidence to a new directory")
+    export.add_argument("task_id")
+    export.add_argument("--output", type=Path, required=True)
     observe = commands.add_parser("observe", help="Read an Android screen locally; no model call")
     observe.add_argument("--serial", default="emulator-5554")
     observe.add_argument("--package", required=True)
@@ -74,6 +78,21 @@ def main():
     args = parser().parse_args()
     try:
         home = args.home.resolve()
+        if args.command == "clear-queue":
+            from sidecar.jobs import JobQueue
+            from sidecar.server import worker_alive
+            from sidecar.worker import recover
+
+            queue = JobQueue(home)
+            if not worker_alive(home):
+                recover(home)
+            emit(queue.clear())
+            return
+        if args.command == "export":
+            from sidecar.evidence import export_evidence
+
+            emit(export_evidence(home, args.task_id, args.output))
+            return
         # 队列服务退出后仍能取消遗留任务，避免新副屏因未结束任务无法启动。
         if (home / "queue.sqlite").exists() and args.command in {
             "pause",

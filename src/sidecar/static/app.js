@@ -4,6 +4,8 @@ const $ = id => document.getElementById(id);
 let token = sessionStorage.getItem('sidecar-token') || '';
 let current = null, config = null, imageUrl = null, busy = false;
 let showFrame = false;
+// Keep uncertain submissions stable until the server acknowledges them.
+const pendingSubmissions = new Map();
 // 记住上次看到的状态，用于生成页面内提示；这里不提供系统推送。
 const seen = new Map();
 // 后端状态到中文标签的映射；排队、执行和等待交接需要分别展示。
@@ -103,10 +105,15 @@ $('pair-form').onsubmit=async event=>{event.preventDefault();token=$('token').va
 $('disconnect').onclick=()=>{sessionStorage.removeItem('sidecar-token');token='';config=null;current=null;seen.clear();$('token').value='';$('pairing').hidden=false;$('console').hidden=true;$('connection').textContent='尚未连接';};
 // 提交目标及模式对应的输入，拿到任务编号后展示执行进度。
 $('task-form').onsubmit=async event=>{
-  event.preventDefault();$('submit').disabled=true;$('error').hidden=true;
+  event.preventDefault();
+  if ($('submit').disabled) return;
+  $('submit').disabled=true;$('error').hidden=true;
   try{
-    const request={goal:$('goal').value,items:config.mode==='demo'?lines('items'):[],criteria:config.mode==='android'?lines('criteria'):[],app:config.mode==='android'?($('app').value||null):null,request_id:crypto.randomUUID?crypto.randomUUID():Date.now()+'-'+Math.random()};
-    const job=await api('/tasks',{method:'POST',body:JSON.stringify(request)});current=job.id;await refresh();
+    const request={goal:$('goal').value,items:config.mode==='demo'?lines('items'):[],criteria:config.mode==='android'?lines('criteria'):[],app:config.mode==='android'?($('app').value||null):null};
+    const key=JSON.stringify([token,config.mode,request]);
+    if(!pendingSubmissions.has(key))pendingSubmissions.set(key,crypto.randomUUID?crypto.randomUUID():Date.now()+'-'+Math.random());
+    request.request_id=pendingSubmissions.get(key);
+    const job=await api('/tasks',{method:'POST',body:JSON.stringify(request)});pendingSubmissions.delete(key);current=job.id;await refresh();
   }catch(e){fail(e);}finally{$('submit').disabled=false;}
 };
 // 暂停或取消只是提交控制请求，页面须等待执行端确认状态。

@@ -124,6 +124,11 @@ class DeviceSetupError(RuntimeError):
     """Setup-stage device failure whose message is safe to show the user."""
 
 
+# 模型服务对请求的可读拒绝（含状态码），同样允许展示给用户。
+class ModelAPIError(RuntimeError):
+    """Model provider rejection whose message is safe to show the user."""
+
+
 # 设备适配器的接口约定，让核心流程不依赖具体手机工具。
 class Device(Protocol):
     device_id: str

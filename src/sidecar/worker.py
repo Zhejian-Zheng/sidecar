@@ -7,7 +7,7 @@ import os
 import time
 from pathlib import Path
 
-from sidecar.contracts import Task
+from sidecar.contracts import ModelAPIError, Task
 from sidecar.harness import TERMINAL, Harness
 from sidecar.jobs import JobQueue
 from sidecar.model import LangChainModel
@@ -107,8 +107,7 @@ def run_next(home):
 
             if saved:
                 # A resumed task's fresh control request wins before execution.
-                prepare()
-                result = h.resume(task_id, job["note"])
+                result = h.resume(task_id, job["note"], prepare=prepare)
             else:
                 result = h.start(task, task_id=task_id, prepare=prepare)
         if config.display and result["status"] in TERMINAL:
@@ -131,6 +130,9 @@ def run_next(home):
             q.finish(task_id, state["status"], state["reason"])
         elif state:
             q.finish(task_id, "interrupted", "执行中断，请核对设备后继续或取消")
+        elif isinstance(exc, ModelAPIError):
+            # 固定的可读消息（含状态码），不含请求或响应正文。
+            q.finish(task_id, "failed", str(exc))
         else:
             # Never store exception bodies: providers and devices may include secrets.
             q.finish(task_id, "failed", f"执行失败（{type(exc).__name__}），请检查设备和模型配置")

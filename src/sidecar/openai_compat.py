@@ -20,7 +20,51 @@ HANDOFF = {"waiting_user", "paused", "interrupted"}
 COMPLETION_TIMEOUT = 120
 HEARTBEAT_INTERVAL = 10
 # 控制命令必须占据整条消息，避免把否定句、引用或说明文字当作恢复授权。
-COMMAND_RE = re.compile(r"(继续|查询)\s*[:：]?\s*([0-9a-fA-F]{32})")
+COMMAND_RE = re.compile(
+    r"(?:请)?(?P<command>继续|恢复|查询|查看|状态|进度|取消|停止|暂停)\s*"
+    r"(?:(?:[\w .-]{1,40}\s*的\s*)?任务(?:编号)?\s*)?[:：]?\s*"
+    r"(?P<id>[0-9a-fA-F]{32})(?P<suffix>\s*的(?:状态|进度))?[。！!]?"
+)
+HELP_TEXT = """支持以下聊天指令（每次单独发送一条）：
+- 查询／状态／进度 <任务编号>
+- 取消／停止 <任务编号>（不会撤销已经执行的操作）
+- 暂停 <任务编号>（在步骤边界生效）
+- 继续／恢复 <任务编号>（先核对执行画面，不授权自动发送或支付）
+- 任务列表／查看队列
+- 清空队列／清除任务队列（取消所有未结束任务，保留历史）
+- 帮助
+也支持：取消 Gmail 的任务<编号>、查看任务<编号>的进度。
+暂停或等待介入的任务会阻塞后续任务，需继续或取消。"""
+STATUS_LABELS = {
+    "queued": "等待执行",
+    "executing": "正在执行",
+    "running": "正在执行",
+    "waiting_user": "等待用户介入",
+    "paused": "已暂停",
+    "interrupted": "执行中断",
+    "completed": "已完成",
+    "failed": "失败",
+    "cancelled": "已取消",
+}
+
+
+def information(text):
+    # An informational reply has no persisted task and never enters the worker queue.
+    return {"id": None, "status": "information", "message": text}, False
+
+
+def chat_information(q, goal):
+    if goal in {"帮助", "指令帮助", "help", "/help"}:
+        return information(HELP_TEXT)
+    if goal in {"任务列表", "查看任务列表", "查看队列", "任务队列"}:
+        jobs = q.list()
+        lines = ["近期任务（最多 50 条）："]
+        for job in jobs:
+            lines.append(f"- {job['id']}：{STATUS_LABELS.get(job['status'], job['status'])}")
+            if blocker := job.get("blocked_by"):
+                lines.append(f"  等待任务 {blocker['id']} 结束或恢复处理。")
+        return information("\n".join(lines) if jobs else "当前没有任务。发送“帮助”查看指令。")
+    return None
 
 
 class ChatMessage(BaseModel):
@@ -77,15 +121,46 @@ def submit_goal(q: JobQueue, goal: str, request_id: str):
 
 # 在发送响应头前完成校验、去重和入队，确保错误仍可返回正常 HTTP 状态码。
 def prepare_completion(q: JobQueue, goal: str, request_id: str | None = None):
-    match = COMMAND_RE.fullmatch(goal.strip())
+    goal = goal.strip()
+    if goal in {"清空队列", "清除任务队列"}:
+        result = q.clear()
+        text = f"已取消 {result['cancelled']} 个任务。"
+        if result["pending"]:
+            text += f"另有 {result['pending']} 个执行中的任务已请求取消，等待步骤边界生效。"
+        return information(text + "历史记录保留，已执行的操作不会撤销。")
+    if info := chat_information(q, goal):
+        return info
+    match = COMMAND_RE.fullmatch(goal)
+    if match and (
+        re.search(r"不要|勿|别|不(?:取消|停止|暂停|继续|恢复)", goal)
+        or (match["suffix"] and match["command"] in {"取消", "停止", "暂停", "继续", "恢复"})
+    ):
+        return information("未执行控制操作。请发送独立、明确的指令，例如：查询 <任务编号>。")
     if match:
-        command, task_id = match.group(1), match.group(2).lower()
+        command, task_id = match["command"], match["id"].lower()
         job = q.get(task_id)
-        if command == "查询" or job["status"] in TERMINAL:
+        if command in {"查询", "查看", "状态", "进度"} or job["status"] in TERMINAL:
             return job, False
+        if command in {"取消", "停止", "暂停"}:
+            return q.control(task_id, "pause" if command == "暂停" else "cancel"), False
         if job["status"] in HANDOFF:
             job = q.resume(task_id, goal)
         return job, True
+    # Incomplete command-shaped requests must not become device tasks.
+    if re.match(r"^(?:请)?(?:取消|停止|暂停|继续|恢复|查询|查看|状态|进度)", goal) and (
+        re.fullmatch(
+            r"(?:请)?(?:取消|停止|暂停|继续|恢复|查询|查看|状态|进度)\s*"
+            r"(?:[\w .-]{1,40}\s*的\s*)?任务(?:编号)?\s*[:：]?\s*"
+            r"[0-9a-fA-F]{0,31}(?:\s*的(?:状态|进度))?[。！!]?",
+            goal,
+        )
+        or re.search(r"[0-9a-fA-F]{32}", goal)
+        or re.fullmatch(r"(?:请)?(?:取消|停止|暂停|继续|恢复|查询|查看|状态|进度)[：: ]*", goal)
+    ):
+        return information(
+            "未执行控制操作。请每次提供一个完整任务编号，"
+            "例如：取消 <32位任务编号>。发送“帮助”查看用法。"
+        )
     request_id = request_id or "openai:goal:" + hashlib.sha256(goal.encode()).hexdigest()
     return submit_goal(q, goal, request_id), True
 
@@ -115,6 +190,8 @@ def is_demo_job(job, mode=None):
 
 
 def result_heading(job, mode=None):
+    if job["status"] == "information":
+        return ""
     heading = f"任务编号：{job['id']}\n"
     if is_demo_job(job, mode):
         heading += "🧪 离线演示模式：仅模拟记录文字，不会操作手机或真实 App。\n"
@@ -123,10 +200,25 @@ def result_heading(job, mode=None):
 
 # 把任务状态转成给客户端的可读文本；交接时附带“继续 <编号>”以便恢复。
 def format_result(job, *, mode=None, include_heading=True):
+    if job["status"] == "information":
+        return job["message"]
     heading = result_heading(job, mode) if include_heading else ""
     status = job["status"]
     reason = job.get("reason") or ""
     state = job.get("state") or {}
+    if job.get("pending_control"):
+        label = "取消" if job["pending_control"] == "cancel" else "暂停"
+        return heading + f"已收到{label}请求，等待当前操作结束后生效。查询进度：查询 {job['id']}"
+    if status == "queued":
+        text = "⏳ 等待执行，尚未开始。"
+        if blocker := job.get("blocked_by"):
+            label = STATUS_LABELS.get(blocker["status"], blocker["status"])
+            text += f"\n前面的任务 {blocker['id']}（{label}）正在占用队列。"
+            if blocker["status"] in HANDOFF:
+                text += (
+                    f"\n核对画面后回复：继续 {blocker['id']}，或放弃旧任务：取消 {blocker['id']}"
+                )
+        return heading + text + f"\n查看进度：查询 {job['id']}"
     if status == "completed":
         if is_demo_job(job, mode):
             goal = (job.get("request") or state.get("task") or {}).get("goal", "")
@@ -140,6 +232,11 @@ def format_result(job, *, mode=None, include_heading=True):
             lines.append("⚠️ 副屏应用未能退出，请核对执行画面。")
         return heading + "\n".join(lines)
     if status in HANDOFF:
+        if status == "paused":
+            return (
+                heading + f"已暂停：{reason}\n核对画面后，请回复：继续 {job['id']}"
+                + f"\n放弃此任务，请回复：取消 {job['id']}"
+            )
         if (state.get("observation") or {}).get("confirmation_targets") and state.get(
             "verification"
         ):
@@ -157,8 +254,13 @@ def format_result(job, *, mode=None, include_heading=True):
                 f"请在应用中核对并手动操作；完成后回复：继续 {job['id']}。"
                 "回复继续不会授权自动点击发送或支付。"
             )
+            lines.append(f"放弃此任务，请回复：取消 {job['id']}")
             return heading + "\n".join(lines)
-        return heading + f"⚠️ 需要你介入：{reason}\n处理完成后，请回复：继续 {job['id']}"
+        return (
+            heading
+            + f"⚠️ 需要你介入：{reason}\n处理完成后，请回复：继续 {job['id']}"
+            + f"\n放弃此任务，请回复：取消 {job['id']}"
+        )
     if status == "cancelled":
         return heading + f"已取消：{reason}"
     if status == "failed":

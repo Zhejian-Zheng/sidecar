@@ -443,3 +443,109 @@ def test_worker_fallback_defers_to_engine_terminal_status(tmp_path, monkeypatch)
     run_next(tmp_path)
 
     assert q.get(job["id"])["status"] == "completed"
+
+
+@pytest.mark.parametrize("signal,expected", [("pause", "paused"), ("cancel", "cancelled")])
+def test_fresh_control_during_resume_prevents_device_actions(
+    tmp_path, monkeypatch, signal, expected
+):
+    from sidecar.offline import OfflineDevice
+    from sidecar.worker import run_next
+
+    q = setup(tmp_path)
+    device = OfflineDevice(q.engine)
+    screen = device.load()
+    screen["logged_in"] = False
+    device.save(screen)
+    task_id = q.submit("任务", ["不能提前创建"])["id"]
+    run_next(tmp_path)
+    assert q.get(task_id)["status"] == "waiting_user"
+    screen["logged_in"] = True
+    device.save(screen)
+    q.resume(task_id, "已登录")
+    original_claim = type(q).claim
+
+    def claim_then_control(self):
+        job = original_claim(self)
+        if job:
+            self.control(job["id"], signal)
+        return job
+
+    monkeypatch.setattr(type(q), "claim", claim_then_control)
+    run_next(tmp_path)
+    assert q.get(task_id)["status"] == expected
+    assert device.load()["items"] == []
+    if signal == "pause":
+        monkeypatch.setattr(type(q), "claim", original_claim)
+        q.resume(task_id, "再次确认继续")
+        run_next(tmp_path)
+        assert q.get(task_id)["status"] == "completed"
+        assert device.load()["items"] == ["不能提前创建"]
+
+
+def test_clear_queue_cancels_all_unfinished_jobs_and_keeps_history(tmp_path):
+    from sidecar.jobs import JobQueue
+
+    q = JobQueue(tmp_path)
+    done = q.submit("done", items=["done"])
+    q.finish(done["id"], "completed")
+    jobs = [q.submit(str(i), items=[str(i)]) for i in range(55)]
+    q.control(jobs[0]["id"], "pause")
+    result = q.clear()
+    assert result == {"cancelled": 55, "pending": 0}
+    assert all(q.get(job["id"])["status"] == "cancelled" for job in jobs)
+    assert q.get(done["id"])["status"] == "completed"
+    assert q.claim() is None
+    assert q.clear() == {"cancelled": 0, "pending": 0}
+
+
+def test_clear_queue_signals_executor_and_releases_saved_handoff(tmp_path):
+    from sidecar.jobs import JobQueue
+    from sidecar.worker import run_next
+
+    q = JobQueue(tmp_path)
+    first = q.submit("first", items=["first"])
+    q.engine.mkdir()
+    (q.engine / "offline-device.json").write_text(
+        '{"logged_in": false, "screen": "list", "draft": "", "items": []}'
+    )
+    run_next(tmp_path)
+    assert q.get(first["id"])["status"] == "waiting_user"
+    q.clear()
+    assert q.state(first["id"])["status"] == "cancelled"
+    second = q.submit("second", items=["second"])
+    q.claim()
+    assert q.clear() == {"cancelled": 0, "pending": 1}
+    assert q.get(second["id"])["pending_control"] == "cancel"
+    third = q.submit("third", items=["third"])
+    assert q.claim() is None
+    q.finish(second["id"], "completed")
+    assert q.get(second["id"])["status"] == "cancelled"
+    assert q.claim()["id"] == third["id"]
+
+
+def test_clear_queue_reaches_active_engine_before_any_device_action(tmp_path):
+    from sidecar.contracts import Task
+    from sidecar.harness import Harness
+    from sidecar.jobs import JobQueue
+    from sidecar.offline import OfflineDevice, OfflinePolicy
+
+    q = JobQueue(tmp_path)
+    job = q.submit("first", items=["first"])
+    q.claim()
+    q.submit("second", items=["second"])
+
+    def clear_during_execution():
+        assert q.clear() == {"cancelled": 1, "pending": 1}
+        assert q.claim() is None
+
+    with Harness(q.engine, OfflineDevice(q.engine), OfflinePolicy()) as harness:
+        result = harness.start(
+            Task(goal="first", criteria=["待办存在：first"]),
+            task_id=job["id"], prepare=clear_during_execution,
+        )
+    assert result["status"] == "cancelled"
+    assert OfflineDevice(q.engine).load()["items"] == []
+    assert not any(event["kind"] == "action_returned" for event in q.events(job["id"]))
+    q.finish(job["id"], result["status"], result["reason"])
+    assert q.get(job["id"])["status"] == "cancelled"

@@ -115,7 +115,9 @@ class LangChainModel:
     # 关闭继承追踪，并把网络异常转为 Harness 能识别的超时或连接错误。
     @staticmethod
     def _invoke(chain, messages):
-        from openai import APIConnectionError, APITimeoutError
+        from openai import APIConnectionError, APIStatusError, APITimeoutError
+
+        from sidecar.contracts import ModelAPIError
 
         try:
             with tracing_context(enabled=False):
@@ -124,6 +126,11 @@ class LangChainModel:
             raise TimeoutError("Model timed out") from exc
         except APIConnectionError as exc:
             raise ConnectionError("Model unavailable") from exc
+        except APIStatusError as exc:
+            # 状态码是诊断关键；不回显 API 的错误正文，避免把请求内容带进日志。
+            raise ModelAPIError(
+                f"模型 API 返回 {exc.status_code}，请检查额度、限流或模型名"
+            ) from exc
 
     # 提取可验证的完成标准，但始终保留用户输入的原始任务目标。
     def plan(self, goal):

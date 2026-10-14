@@ -20,6 +20,7 @@ import org.json.JSONObject;
 
 /** Single request, shell-only bridge. Never injects keys, clicks, focus or clipboard data. */
 public final class Main {
+    private static String stage = "prepare";
     private static String string(CharSequence value) { return value == null ? "" : value.toString(); }
 
     private static void verify(JSONObject request) throws Exception {
@@ -36,7 +37,7 @@ public final class Main {
         if (!unique.equals(binding.getString("unique_id"))) throw new IllegalStateException();
     }
 
-    private static boolean matches(AccessibilityNodeInfo node, JSONObject selector, String pkg) throws Exception {
+    private static boolean matchesIdentity(AccessibilityNodeInfo node, JSONObject selector, String pkg) throws Exception {
         Rect bounds = new Rect();
         node.getBoundsInScreen(bounds);
         JSONArray box = selector.getJSONArray("bounds");
@@ -44,10 +45,52 @@ public final class Main {
             && pkg.equals(string(node.getPackageName()))
             && selector.getString("resource_id").equals(string(node.getViewIdResourceName()))
             && selector.getString("class_name").equals(string(node.getClassName()))
-            && selector.getString("old_text").equals(string(node.getText()))
             && selector.getString("description").equals(string(node.getContentDescription()))
             && box.length() == 4 && bounds.equals(new Rect(box.getInt(0), box.getInt(1), box.getInt(2), box.getInt(3)))
             && node.getActionList().contains(AccessibilityNodeInfo.AccessibilityAction.ACTION_SET_TEXT);
+    }
+
+    private static boolean matches(AccessibilityNodeInfo node, JSONObject selector, String pkg) throws Exception {
+        return matchesIdentity(node, selector, pkg)
+            && selector.getString("old_text").equals(string(node.getText()));
+    }
+
+    // EditText 会把换行等空白规范化，严格相等会把成功的写入误判成未核验。
+    private static String normalize(String value) {
+        return value == null ? "" : value.replaceAll("\\s+", " ").trim();
+    }
+
+    // Re-read the original window; matching text in a different field is not proof.
+    private static boolean confirms(UiAutomation automation, int id, int windowId,
+                                    JSONObject selector, String pkg, String expected) throws Exception {
+        List<AccessibilityWindowInfo> windows = automation.getWindowsOnAllDisplays().get(id);
+        if (windows == null) return false;
+        List<AccessibilityNodeInfo> nodes = new ArrayList<>();
+        for (AccessibilityWindowInfo window : windows) {
+            if (window.getDisplayId() == id && window.getId() == windowId)
+                collectNodes(window.getRoot(), nodes, 0);
+        }
+        return confirmsNodes(nodes, selector, pkg, expected);
+    }
+
+    private static boolean confirmsNodes(List<AccessibilityNodeInfo> nodes, JSONObject selector,
+                                         String pkg, String expected) throws Exception {
+        AccessibilityNodeInfo target = null;
+        for (AccessibilityNodeInfo node : nodes) {
+            if (!matchesIdentity(node, selector, pkg)) continue;
+            if (target != null) return false;
+            target = node;
+        }
+        return target != null && normalize(expected).equals(normalize(string(target.getText())));
+    }
+
+    private static void collectNodes(AccessibilityNodeInfo node, List<AccessibilityNodeInfo> nodes,
+                                     int depth) throws Exception {
+        if (node == null) return;
+        if (depth > 100) throw new IllegalStateException();
+        nodes.add(node);
+        for (int i = 0; i < node.getChildCount(); i++)
+            collectNodes(node.getChild(i), nodes, depth + 1);
     }
 
     private static void collect(AccessibilityNodeInfo node, JSONObject selector, String pkg,
@@ -59,7 +102,9 @@ public final class Main {
     }
 
     private static JSONObject write(UiAutomation automation, JSONObject request) throws Exception {
+        stage = "display_verify";
         verify(request);
+        stage = "target";
         int id = request.getJSONObject("display").getInt("id");
         JSONObject selector = request.getJSONObject("selector");
         String pkg = request.getString("package");
@@ -80,11 +125,18 @@ public final class Main {
         if (targetWindow == null || targetWindow.getDisplayId() != id) throw new IllegalStateException();
         Bundle arguments = new Bundle();
         arguments.putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text);
+        stage = "write";
         boolean ok = target.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, arguments);
         // Do not replay writes. A rejected or unverified result is an uncertain operation.
-        boolean verified = ok && target.refresh() && text.equals(string(target.getText()));
+        // Re-enumerate fresh nodes, preserving the original window and field identity.
+        stage = ok ? "verification" : "write_rejected";
+        boolean verified = ok && confirms(automation, id, targetWindow.getId(), selector, pkg, text);
+        String resultStage = stage;
+        stage = "post_display_verify";
         verify(request);
-        return new JSONObject().put("ok", ok).put("verified", verified);
+        JSONObject result = new JSONObject().put("ok", ok).put("verified", verified);
+        if (!verified) result.put("stage", resultStage);
+        return result;
     }
 
     public static void main(String[] args) {
@@ -102,7 +154,9 @@ public final class Main {
             String line = new BufferedReader(new InputStreamReader(System.in, "UTF-8")).readLine();
             if (line == null || line.length() > 65536) throw new IllegalArgumentException();
             JSONObject request = new JSONObject(line);
+            stage = "display_verify";
             verify(request);
+            stage = "connection";
             thread.start();
             Class<?> connection = Class.forName("android.app.IUiAutomationConnection");
             Object binder = Class.forName("android.app.UiAutomationConnection").getConstructor().newInstance();
@@ -116,7 +170,7 @@ public final class Main {
             System.out.println(result.toString());
             status = result.getBoolean("verified") ? 0 : 1;
         } catch (Exception failure) {
-            System.out.println("{\"ok\":false,\"verified\":false}");
+            System.out.println("{\"ok\":false,\"verified\":false,\"stage\":\"" + stage + "\"}");
             System.err.println("Scoped text input rejected: " + failure.getClass().getSimpleName());
         } finally {
             if (automation != null) try { UiAutomation.class.getMethod("disconnect").invoke(automation); } catch (Exception ignored) { }

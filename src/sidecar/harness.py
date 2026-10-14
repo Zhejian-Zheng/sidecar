@@ -19,14 +19,17 @@ from sidecar.contracts import (
     DecisionModel,
     Device,
     DeviceSetupError,
+    ModelAPIError,
     Observation,
     Task,
     Verification,
 )
-from sidecar.errors import ObservationError
+from sidecar.errors import ObservationError, TextInputError
 from sidecar.store import Store
 
 TERMINAL = {"completed", "failed", "cancelled"}
+# 敏感页面（登录、注册、验证码、支付等）一律交回用户手动完成。
+HANDOFF_REASON = "检测到需要你亲自处理的页面（登录、注册、验证码、支付等）；请手动完成后回复继续"
 
 
 # LangGraph 节点共享的任务状态，包含当前动作、历史和运行预算。
@@ -141,7 +144,9 @@ class Harness:
             return self._run(state, state)
 
     # 核对设备和任务状态，记录用户交接说明，再从新观察恢复。
-    def resume(self, task_id: str, note: str) -> dict:
+    def resume(
+        self, task_id: str, note: str, prepare: Callable[[], None] | None = None
+    ) -> dict:
         if not note.strip() or len(note) > 1000:
             raise ValueError("resume needs a note of 1–1000 characters after reviewing the device")
         with self.store.execution_lock(), self._device_lock():
@@ -160,6 +165,9 @@ class Harness:
                 self.store.save(state)
                 return state
             self.store.control(task_id, "")
+            # Clear the previous pause before re-reading fresh queue controls.
+            if prepare:
+                prepare()
             self.store.event(
                 task_id,
                 "user_resumed",
@@ -202,7 +210,7 @@ class Harness:
             stage = exc.stage if isinstance(exc, ObservationError) else self.failure_stage
             reason = (
                 str(exc)
-                if isinstance(exc, ObservationError)
+                if isinstance(exc, (ObservationError, ModelAPIError))
                 else (f"执行失败（{type(exc).__name__}），请核对执行记录和设备状态")
             )
             result.update(status="failed", reason=reason)
@@ -243,19 +251,25 @@ class Harness:
                 pass  # A live executor acknowledges at its next boundary.
         self.store.event(task_id, "control", {"signal": signal})
 
-    # 只对模型连接故障有限重试，每次尝试前检查取消、暂停和超时。
+    # 对连接故障和偶发的输出格式错误有限重试，每次尝试前检查取消、暂停和超时。
     def _model_call(self, state, call):
+        from langchain_core.exceptions import OutputParserException
+
         for attempt in range(2):
             if self._boundary(state):
                 return None
             try:
                 return call()
-            except (TimeoutError, ConnectionError):
+            except (TimeoutError, ConnectionError, OutputParserException) as exc:
                 if self._boundary(state):
                     return None
                 if attempt:
                     raise
-                self.store.event(state["task_id"], "model_retry", {"attempt": 2})
+                self.store.event(
+                    state["task_id"],
+                    "model_retry",
+                    {"attempt": 2, "error": type(exc).__name__},
+                )
                 time.sleep(0.25)
 
     # 在步骤边界检查用户控制和时间预算，返回需要终止或暂停的状态。
@@ -300,7 +314,10 @@ class Harness:
             "action": None,
         }
         if observation.requires_human:
-            update.update(status="waiting_user", reason="Device requires user intervention")
+            update.update(
+                status="waiting_user",
+                reason=HANDOFF_REASON,
+            )
         elif stalls >= state["limits"]["stalls"]:
             update.update(status="failed", reason="No visible progress")
         return update
@@ -334,7 +351,10 @@ class Harness:
         action = Action.model_validate(state["action"])
         observation = self._capture(state)
         if observation.requires_human:
-            return {"status": "waiting_user", "reason": "Device requires user intervention"}
+            return {
+                "status": "waiting_user",
+                "reason": HANDOFF_REASON,
+            }
         previous = Observation.model_validate(state["observation"])
         validate = getattr(self.device, "is_current", None)
         current = (
@@ -367,11 +387,21 @@ class Harness:
             self.store.event(
                 state["task_id"],
                 "uncertain_action",
-                {"action_id": action_id, "error_type": type(exc).__name__},
+                {
+                    "action_id": action_id,
+                    "error_type": type(exc).__name__,
+                    **(
+                        {"operation": "text_input", "stage": exc.stage}
+                        if isinstance(exc, TextInputError)
+                        else {}
+                    ),
+                },
             )
             return {
                 "status": "waiting_user",
-                "reason": "Action outcome unknown; check device",
+                "reason": str(exc)
+                if isinstance(exc, TextInputError)
+                else "Action outcome unknown; check device",
                 **self._history(state, "Last action outcome unknown; do not blindly repeat"),
             }
         self.store.outcome(action_id, "returned")

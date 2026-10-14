@@ -30,3 +30,24 @@ def observation_stage(stage):
         raise
     except Exception as exc:
         raise ObservationError(stage) from exc
+
+
+TEXT_INPUT_ERRORS = {
+    "display_verify": "文字输入前的执行屏校验失败，尚未尝试写入",
+    "prepare": "文字输入桥接准备失败，尚未尝试写入",
+    "connection": "文字输入桥接连接失败，尚未尝试写入",
+    "target": "目标输入框无法唯一匹配或已变化，尚未尝试写入",
+    "write": "文字写入调用失败，无法确认是否生效，请核对输入框后继续",
+    "write_rejected": "目标输入框拒绝了文字写入，请核对输入框后继续",
+    "verification": "文字写入调用已返回成功，但写入后的核验未通过，请核对输入框后继续",
+    "post_display_verify": "文字写入后的执行屏校验失败，请核对设备上的输入结果",
+    "transport": "文字输入桥接调用失败或超时，写入结果未知，请核对输入框后继续",
+    "protocol": "文字输入桥接未返回有效结论，写入结果未知，请核对输入框后继续",
+    "unknown": "文字输入失败，未能确定具体阶段，请核对输入框后继续",
+}
+
+
+class TextInputError(RuntimeError):
+    def __init__(self, stage):
+        self.stage = stage if isinstance(stage, str) and stage in TEXT_INPUT_ERRORS else "unknown"
+        super().__init__(TEXT_INPUT_ERRORS[self.stage])

@@ -8,7 +8,7 @@ import sys
 import time
 from contextlib import nullcontext, redirect_stdout, suppress
 
-from sidecar.errors import ObservationError, observation_stage
+from sidecar.errors import ObservationError, TextInputError, observation_stage
 
 
 def connect_device(serial):
@@ -68,11 +68,16 @@ def run():
             with observation_stage("page_changed"):
                 if d.app_current() != current:
                     raise ObservationError("page_changed")
+            # 屏幕尺寸用于坐标落点校验；取不到时按未知处理，由上层保守决定。
+            size = getattr(d, "window_size", None)
+            width, height = size() if size else (None, None)
             response = dict(
                 xml=xml,
                 package=current["package"],
                 activity=current.get("activity", ""),
                 image=base64.b64encode(out.getvalue()).decode(),
+                width=width,
+                height=height,
             )
         elif request["op"] == "execute":
             # 控件动作使用边界中心；视觉坐标按设备尺寸转换，输入替换当前字段。
@@ -111,6 +116,8 @@ def main():
 
     try:
         print(json.dumps(run()))
+    except TextInputError as exc:
+        print(json.dumps({"error": {"text_input_stage": exc.stage}}))
     except ObservationError as exc:
         print(json.dumps({"error": {"observation_stage": exc.stage}}))
     except Exception as exc:
@@ -135,7 +142,7 @@ def display_request(request):
             with observation_stage("connection"):
                 device = connect_device(serial)
             try:
-                package, activity, xml, image = displays.observe(serial, binding, device)
+                package, activity, xml, image, info = displays.observe(serial, binding, device)
             except Exception:
                 # A release failure must not overwrite the original capture failure.
                 with suppress(Exception):
@@ -154,6 +161,8 @@ def display_request(request):
                 xml=xml,
                 image=base64.b64encode(out.getvalue()).decode(),
                 display=binding.model_dump(),
+                width=info["width"],
+                height=info["height"],
             )
         elif request["op"] == "execute":
             displays.verify(serial, binding)

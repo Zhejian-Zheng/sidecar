@@ -458,6 +458,41 @@ def test_prepare_uncontrolled_error_hides_message(tmp_path):
         assert "private-token-do-not-log" not in result["reason"]
 
 
+@pytest.mark.parametrize("stage", ["decide", "verify"])
+def test_model_api_rejection_keeps_safe_status_message(tmp_path, stage):
+    import httpx
+    from openai import RateLimitError
+
+    from sidecar.model import LangChainModel
+
+    class Reject:
+        def invoke(self, messages):
+            raise RateLimitError(
+                "private-provider-body",
+                response=httpx.Response(
+                    429, request=httpx.Request("POST", "https://example.invalid")
+                ),
+                body={"secret": "private-provider-body"},
+            )
+
+    class Policy:
+        def decide(self, *args):
+            if stage == "decide":
+                return LangChainModel._invoke(Reject(), [])
+            return Action(kind="finish", reason="check")
+
+        def verify(self, *args):
+            return LangChainModel._invoke(Reject(), [])
+
+    with Harness(tmp_path, Screen(), Policy()) as h:
+        result = h.start(task())
+        assert result["status"] == "failed"
+        assert "模型 API 返回 429" in result["reason"]
+        events = h.events(result["task_id"])
+        assert "private-provider-body" not in str(events)
+        assert next(e["data"]["stage"] for e in events if e["kind"] == "error") == stage
+
+
 @pytest.mark.parametrize("request_kind", ["finish", "handoff", "tap"])
 @pytest.mark.parametrize("prepared", [True, False])
 def test_final_submission_stays_manual_and_readiness_is_verified(tmp_path, request_kind, prepared):
@@ -565,3 +600,22 @@ def test_preparation_cannot_be_claimed_without_complete_consistent_evidence(chec
     requested = Task(goal="send", criteria=["content", "sent"])
     assert not verification.ready_for_confirmation(requested)
     assert not verification.satisfies(requested)
+
+
+def test_text_failure_preserves_stage_and_never_replays(tmp_path):
+    from sidecar.errors import TextInputError
+
+    class FailingScreen(Screen):
+        def execute(self, action):
+            self.items.append(action.text)
+            raise TextInputError("verification")
+
+    screen = FailingScreen()
+    with Harness(tmp_path, screen, Policy()) as agent:
+        result = agent.start(task())
+        assert result["status"] == "waiting_user"
+        assert "核验" in result["reason"]
+        assert screen.items == ["read"]
+        event = next(e for e in agent.events(result["task_id"]) if e["kind"] == "uncertain_action")
+        assert event["data"]["stage"] == "verification"
+        assert event["data"]["operation"] == "text_input"

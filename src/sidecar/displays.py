@@ -17,7 +17,7 @@ from xml.etree import ElementTree as ET
 from pydantic import Field
 
 from sidecar.contracts import DeviceSetupError, Message
-from sidecar.errors import ObservationError, observation_stage
+from sidecar.errors import ObservationError, TextInputError, observation_stage
 
 
 class DisplayBinding(Message):
@@ -26,9 +26,10 @@ class DisplayBinding(Message):
     boot_id: str = Field(min_length=1)
 
 
-def run(args, timeout=12, input=None):
+def run(args, timeout=12, input=None, allow_exit_one=False):
     result = subprocess.run(args, input=input, capture_output=True, timeout=timeout)
-    if result.returncode:
+    # textbridge 用退出码 1 表示「写入已发生但无法核验」，它的 JSON 结论仍在 stdout。
+    if result.returncode and not (allow_exit_one and result.returncode == 1):
         raise RuntimeError("Display operation failed; no primary-display fallback")
     return result.stdout
 
@@ -159,7 +160,7 @@ def screenshot(serial, binding):
 
 def observe(serial, binding, device):
     with observation_stage("display_verify"):
-        verify(serial, binding)
+        info = verify(serial, binding)
     with observation_stage("foreground"):
         package, activity = current(serial, binding.id)
     with observation_stage("hierarchy"):
@@ -169,7 +170,7 @@ def observe(serial, binding, device):
     with observation_stage("page_changed"):
         if current(serial, binding.id) != (package, activity):
             raise ObservationError("page_changed")
-    return package, activity, xml, image
+    return package, activity, xml, image, info
 
 
 def launch(serial, binding, package):
@@ -239,38 +240,54 @@ def execute(serial, binding, payload):
 
 def set_text(serial, binding, package, payload):
     """One node-scoped write; never retry or fall back to focus/clipboard input."""
-    verify(serial, binding)
-    selector = payload.get("selector")
-    if not isinstance(selector, dict) or not isinstance(payload.get("text"), str):
-        raise ValueError("Explicit input node and text required")
-    bridge = Path(__file__).with_name("assets") / "textbridge.jar"
-    # Content-addressed name prevents a different local build replacing an in-flight bridge.
-    import hashlib
+    stage = "display_verify"
+    try:
+        verify(serial, binding)
+        stage = "prepare"
+        selector = payload.get("selector")
+        if not isinstance(selector, dict) or not isinstance(payload.get("text"), str):
+            raise ValueError("Explicit input node and text required")
+        bridge = Path(__file__).with_name("assets") / "textbridge.jar"
+        # Content-addressed name prevents a different local build replacing an in-flight bridge.
+        import hashlib
 
-    digest = hashlib.sha256(bridge.read_bytes()).hexdigest()[:20]
-    remote = f"/data/local/tmp/sidecar-text-{digest}.jar"
-    run(["adb", "-s", serial, "push", str(bridge), remote])
-    request = dict(
-        display=binding.model_dump(), package=package, selector=selector, text=payload["text"]
-    )
-    response = run(
-        [
-            "adb",
-            "-s",
-            serial,
-            "shell",
-            "CLASSPATH=" + remote,
-            "app_process",
-            "/",
-            "dev.sidecar.textbridge.Main",
-        ],
-        input=(json.dumps(request, ensure_ascii=False) + "\n").encode(),
-        timeout=15,
-    )
-    result = json.loads(response)
-    if result.get("ok") is not True or result.get("verified") is not True:
-        raise RuntimeError("Text input was rejected or could not be verified; do not retry blindly")
-    verify(serial, binding)
+        digest = hashlib.sha256(bridge.read_bytes()).hexdigest()[:20]
+        remote = f"/data/local/tmp/sidecar-text-{digest}.jar"
+        run(["adb", "-s", serial, "push", str(bridge), remote])
+        request = dict(
+            display=binding.model_dump(), package=package, selector=selector, text=payload["text"]
+        )
+        stage = "transport"
+        response = run(
+            [
+                "adb",
+                "-s",
+                serial,
+                "shell",
+                "CLASSPATH=" + remote,
+                "app_process",
+                "/",
+                "dev.sidecar.textbridge.Main",
+            ],
+            input=(json.dumps(request, ensure_ascii=False) + "\n").encode(),
+            timeout=15,
+            allow_exit_one=True,
+        )
+        try:
+            result = json.loads(response)
+        except ValueError:
+            raise TextInputError("protocol") from None
+        if not isinstance(result, dict):
+            raise TextInputError("protocol")
+        if result.get("ok") is not True or result.get("verified") is not True:
+            fallback = "verification" if result.get("ok") is True else "unknown"
+            raise TextInputError(result.get("stage", fallback))
+        stage = "post_display_verify"
+        verify(serial, binding)
+    except TextInputError:
+        raise
+    except Exception as exc:
+        raise TextInputError(stage) from exc
 
 
 @contextmanager
