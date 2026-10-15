@@ -51,7 +51,15 @@ public final class VerificationTest {
         target.setPassword(false);
         target.setBoundsInScreen(new Rect(20, 20, 120, 120));
         check(verify, selector, Arrays.asList(target, other), false, "moved target is uncertain");
-        System.out.println("6 bridge verification checks passed");
+        Method written = Main.class.getDeclaredMethod("writtenContent", AccessibilityNodeInfo.class,
+                String.class, String.class);
+        written.setAccessible(true);
+        if (!(Boolean) written.invoke(null, target, "com.test", "Hello"))
+            throw new AssertionError("original resized node must verify");
+        target.setText("Hello  world");
+        if ((Boolean) written.invoke(null, target, "com.test", "Hello world"))
+            throw new AssertionError("whitespace changes must not verify exact body");
+        System.out.println("6 bridge verification checks passed; resized-node checks passed");
     }
 
     private static void check(Method verify, JSONObject selector, List<AccessibilityNodeInfo> nodes,

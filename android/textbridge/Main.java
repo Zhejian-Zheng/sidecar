@@ -84,6 +84,23 @@ public final class Main {
         return target != null && normalize(expected).equals(normalize(string(target.getText())));
     }
 
+    // The original accessibility node keeps its source/window identity across layout changes.
+    private static boolean writtenContent(AccessibilityNodeInfo node, String pkg, String expected) {
+        return node.isEditable() && node.isEnabled() && node.isVisibleToUser() && !node.isPassword()
+            && pkg.equals(string(node.getPackageName()))
+            && expected.equals(string(node.getText()));
+    }
+
+    private static boolean confirmsOriginal(AccessibilityNodeInfo target, String pkg,
+                                            String expected) throws Exception {
+        for (int attempt = 0; attempt < 10; attempt++) {
+            if (!target.refresh()) return false;
+            if (writtenContent(target, pkg, expected)) return true;
+            Thread.sleep(100); // Re-read only; never replay the write.
+        }
+        return false;
+    }
+
     private static void collectNodes(AccessibilityNodeInfo node, List<AccessibilityNodeInfo> nodes,
                                      int depth) throws Exception {
         if (node == null) return;
@@ -130,7 +147,7 @@ public final class Main {
         // Do not replay writes. A rejected or unverified result is an uncertain operation.
         // Re-enumerate fresh nodes, preserving the original window and field identity.
         stage = ok ? "verification" : "write_rejected";
-        boolean verified = ok && confirms(automation, id, targetWindow.getId(), selector, pkg, text);
+        boolean verified = ok && confirmsOriginal(target, pkg, text);
         String resultStage = stage;
         stage = "post_display_verify";
         verify(request);

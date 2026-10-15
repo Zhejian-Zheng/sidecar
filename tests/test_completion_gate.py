@@ -75,7 +75,8 @@ def test_model_success_cannot_override_program(tmp_path, sample, completed):
     ],
 )
 def test_incomplete_evidence_never_passes(change):
-    from sidecar.verifiers import evaluate, extract_ui
+    from sidecar.app_actions import evaluate
+    from sidecar.verifiers import extract_ui
 
     xml = (
         Path(__file__).parent / "fixtures/google_clock/7.5/target-enabled/hierarchy.xml"
@@ -107,7 +108,7 @@ def test_incomplete_evidence_never_passes(change):
 
 
 def test_gmail_never_falls_back_to_model():
-    from sidecar.verifiers import evaluate
+    from sidecar.app_actions import evaluate
 
     task = Task(goal="Save draft", criteria=["saved"], requirement={"kind": "gmail_draft_saved"})
     assert evaluate(task, Observation(text="Saved"))["status"] == "uncertain"
@@ -136,12 +137,12 @@ def test_requirement_survives_queue_storage(tmp_path):
 
 
 def test_verifier_exception_cannot_complete(tmp_path, monkeypatch):
-    from sidecar import verifiers
+    from sidecar import app_actions
 
     def broken(*args):
         raise RuntimeError("internal error")
 
-    monkeypatch.setattr(verifiers, "evaluate", broken)
+    monkeypatch.setattr(app_actions, "evaluate", broken)
 
     class Device:
         device_id = "test"
@@ -212,7 +213,8 @@ def test_chinese_meridiem_resolves_to_24h():
 
 
 def test_dual_notation_goal_is_not_a_conflict():
-    from sidecar.verifiers import evaluate, extract_ui
+    from sidecar.app_actions import evaluate
+    from sidecar.verifiers import extract_ui
 
     xml = (
         Path(__file__).parent / "fixtures/google_clock/7.5/target-enabled/hierarchy.xml"
@@ -271,7 +273,8 @@ def test_gmail_gate_is_scoped_to_drafts(tmp_path, goal, is_draft):
     ],
 )
 def test_explicit_requirement_cannot_override_conflicting_goal(goal, sample, status):
-    from sidecar.verifiers import evaluate, extract_ui
+    from sidecar.app_actions import evaluate
+    from sidecar.verifiers import extract_ui
 
     xml = (
         Path(__file__).parent / "fixtures/google_clock/7.5" / sample / "hierarchy.xml"
@@ -292,7 +295,8 @@ def test_explicit_requirement_cannot_override_conflicting_goal(goal, sample, sta
 def test_unrecognized_or_hidden_page_is_not_completion_evidence(mutation):
     from xml.etree import ElementTree as ET
 
-    from sidecar.verifiers import evaluate, extract_ui
+    from sidecar.app_actions import evaluate
+    from sidecar.verifiers import extract_ui
 
     root = ET.parse(
         Path(__file__).parent / "fixtures/google_clock/7.5/target-enabled/hierarchy.xml"
@@ -329,7 +333,8 @@ def test_unrecognized_or_hidden_page_is_not_completion_evidence(mutation):
     "sample,expected", [("list-disabled", "passed"), ("target-enabled", "failed")]
 )
 def test_disable_checks_disabled_state(sample, expected):
-    from sidecar.verifiers import evaluate, extract_ui, infer_requirement
+    from sidecar.app_actions import evaluate, infer_requirement
+    from sidecar.verifiers import extract_ui
 
     nodes, _ = extract_ui(
         (Path(__file__).parent / "fixtures/google_clock/7.5" / sample / "hierarchy.xml").read_text()
@@ -366,3 +371,30 @@ def test_direct_harness_start_cannot_omit_clock_gate(tmp_path):
         assert result["status"] == "waiting_user"
         assert result["task"]["requirement"]["expected_time"] == "23:58"
         assert h.resume(result["task_id"], "continue")["status"] == "waiting_user"
+
+
+def test_program_uncertainty_preserves_actual_handoff_reason(tmp_path):
+    class Device:
+        device_id = "gmail-test"
+
+        def observe(self):
+            return Observation(
+                text="Suggestions cover fields", confirmation_targets={"send": "Send"}
+            )
+
+    class Model:
+        def decide(self, *args):
+            return Action(kind="handoff", reason="收件人浮层遮挡主题和正文")
+
+        def verify(self, task, obs):
+            return Verification(
+                checks=[
+                    Check(criterion="saved", passed=False, evidence="No subject or body visible")
+                ]
+            )
+
+    task = Task(goal="Save draft", criteria=["saved"], requirement={"kind": "gmail_draft_saved"})
+    with Harness(tmp_path, Device(), Model()) as h:
+        result = h.start(task)
+    assert "收件人浮层遮挡主题和正文" in result["reason"]
+    assert result["status"] == "waiting_user"

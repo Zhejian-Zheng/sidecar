@@ -14,6 +14,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
 from langsmith import tracing_context
 
+from sidecar.app_actions import by_kind
 from sidecar.contracts import (
     Action,
     DecisionModel,
@@ -48,6 +49,7 @@ class State(TypedDict):
     verification: dict | None
     fingerprint: str
     stalls: int
+    app_context: dict
     limits: dict
 
 
@@ -114,7 +116,7 @@ class Harness:
         self, task: Task, task_id: str | None = None, prepare: Callable[[], None] | None = None
     ) -> dict:
         if task.requirement is None:
-            from sidecar.verifiers import infer_requirement
+            from sidecar.app_actions import infer_requirement
 
             requirement = infer_requirement(getattr(self.device, "package", None), task.goal)
             task = task.model_copy(update={"requirement": requirement})
@@ -132,6 +134,7 @@ class Harness:
                 verification=None,
                 fingerprint="",
                 stalls=0,
+                app_context={},
                 limits=self.limits,
             )
             self.store.create(state)
@@ -271,8 +274,11 @@ class Harness:
 
     # 读取新界面并记录简要观察事件，截图仍保存在观察数据中。
     def _capture(self, state, fresh=False):
-        capture = (getattr(self.device, "observe_fresh", self.device.observe)
-                   if fresh else self.device.observe)
+        capture = (
+            getattr(self.device, "observe_fresh", self.device.observe)
+            if fresh
+            else self.device.observe
+        )
         observation = capture()
         self.store.event(
             state["task_id"],
@@ -394,7 +400,26 @@ class Harness:
             }
         self.store.outcome(action_id, "returned")
         self.store.event(state["task_id"], "action_returned", {"action_id": action_id})
-        return self._history(state, f"{action.kind}: {action.reason}; check next observation")
+        update = self._history(state, f"{action.kind}: {action.reason}; check next observation")
+        task = Task.model_validate(state["task"])
+        app = by_kind(task.requirement.kind) if task.requirement else None
+        if app is not None and app.evidence_chain:
+            try:
+                after = self._capture(state, fresh=True)
+                update["app_context"] = app.advance(
+                    task,
+                    observation,
+                    after,
+                    action,
+                    state.get("app_context") or {},
+                )
+            except Exception as exc:
+                # 证据采集失败不得把已成功的动作变成任务失败；放弃本次证据推进。
+                update["app_context"] = {}
+                self.store.event(
+                    state["task_id"], "evidence_capture_failed", {"type": type(exc).__name__}
+                )
+        return update
 
     # 用新的观察逐项验证；证据不足时继续循环，而不是直接报告完成。
     def _verify(self, state, final_action_blocked=False):
@@ -415,8 +440,10 @@ class Harness:
         from sidecar.verification_policy import POLICY_SHA256
 
         evidence = {
-            **verification.model_dump(), "observation_id": observation.id,
-            "method": "model_with_fresh_observation", "viewport": observation.viewport,
+            **verification.model_dump(),
+            "observation_id": observation.id,
+            "method": "model_with_fresh_observation",
+            "viewport": observation.viewport,
             "display_session": observation.display_session,
             "verified_at": datetime.now(timezone.utc).isoformat(),
             "policy_sha256": POLICY_SHA256,
@@ -425,16 +452,21 @@ class Harness:
         model_passed = verification.satisfies(task)
         program = None
         if task.requirement:
-            from sidecar.verifiers import evaluate
+            from sidecar.app_actions import evaluate
 
             try:
-                program = evaluate(task, observation)
+                program = evaluate(task, observation, state.get("app_context"))
             except Exception:
-                program = {"status": "uncertain", "reason": "程序验证异常，未确认完成",
-                           "observation_id": observation.id, "evidence": []}
+                program = {
+                    "status": "uncertain",
+                    "reason": "程序验证异常，未确认完成",
+                    "observation_id": observation.id,
+                    "evidence": [],
+                }
         can_complete = model_passed and (program is None or program["status"] == "passed")
         evidence.update(
-            model_verification=verification.model_dump(), program_verdict=program,
+            model_verification=verification.model_dump(),
+            program_verdict=program,
             conclusion="completed" if can_complete else "not_completed",
             method="model_and_program" if task.requirement else "model_only",
         )
@@ -456,9 +488,16 @@ class Harness:
         if program and program["status"] != "passed":
             attempts = evidence["program_attempts"]
             return {
-                "status": "waiting_user" if program["status"] == "uncertain" or attempts >= 3
-                          else "running",
-                "reason": "未完成：" + program["reason"],
+                "status": "waiting_user"
+                if program["status"] == "uncertain" or attempts >= 3
+                else "running",
+                "reason": (
+                    state["action"]["reason"] + "；"
+                    if (state.get("action") or {}).get("kind") == "handoff"
+                    else ""
+                )
+                + "未完成："
+                + program["reason"],
                 "verification": evidence,
                 "observation": observation.model_dump(),
                 **self._history(state, "Program verification: " + program["reason"]),

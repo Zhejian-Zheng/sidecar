@@ -212,14 +212,8 @@ class AndroidDevice:
             package_name = attrs.get("package", "")
             ime_backspace = (
                 package_name != self.package
-                and (
-                    "inputmethod" in package_name
-                    or package_name in {
-                        "com.google.android.inputmethod.latin",
-                        "com.android.inputmethod.latin",
-                        "com.samsung.android.honeyboard",
-                    }
-                )
+                and package_name == data.get("active_ime_package")
+                and attrs.get("class") == "android.widget.FrameLayout"
                 and not attrs.get("text")
                 and not attrs.get("resource-id")
                 and attrs.get("content-desc", "").strip().casefold()

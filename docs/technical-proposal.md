@@ -83,10 +83,10 @@ def queue_finish(current: str, signal: str, proposed: str, reason: str) -> Statu
 model_passed = verification.satisfies(task)
 program = None
 if task.requirement:
-    from sidecar.verifiers import evaluate
+    from sidecar.app_actions import evaluate
 
     try:
-        program = evaluate(task, observation)
+        program = evaluate(task, observation, state.get("app_context"))
     except Exception:
         program = {"status": "uncertain", "reason": "程序验证异常，未确认完成",
                    "observation_id": observation.id, "evidence": []}
@@ -98,11 +98,13 @@ evidence.update(
 )
 ```
 
-[verifiers.py](../src/sidecar/verifiers.py) 的 Clock 验证器限定 Google Clock 7.5：
+按 App 拆分的确定性验证器放在 [app_actions/](../src/sidecar/app_actions/)，
+Harness 只通过注册表（按 requirement kind）调用，不直接认识任何 App。
+Clock 验证器（app_actions/clock.py）限定 Google Clock 7.5：
 
 - 从父子节点关联已保存卡片、精确 `onoff` 资源 ID、时间与开关三态。
 - 目标含糊、意图冲突、节点截断、隐藏节点、额外窗口或未知页面结构返回 `uncertain`。
-- 页面结构使用[真实样本生成的白名单](../src/sidecar/assets/clock-page-paths.json)。
+- 页面结构使用[真实样本生成的白名单](../src/sidecar/app_actions/clock-page-paths.json)。
 - 明确状态不符时反馈给模型重新决策，累计三次程序拒绝后交接；不确定时直接交接。
 
 报告分别保存模型自评、程序 verdict、最终 conclusion 和观察编号。

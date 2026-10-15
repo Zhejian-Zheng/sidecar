@@ -49,8 +49,13 @@ does not authorize new unrelated actions. Give a short action explanation, not h
 class LangChainModel:
     # 接收三条模型调用链和图片能力标记，便于切换提供商及离线测试。
     def __init__(
-        self, decision_chain, verification_chain, planning_chain=None, *, supports_images=True,
-        conversation_chain=None
+        self,
+        decision_chain,
+        verification_chain,
+        planning_chain=None,
+        *,
+        supports_images=True,
+        conversation_chain=None,
     ):
         self.decision_chain = decision_chain
         self.verification_chain = verification_chain
@@ -152,10 +157,13 @@ class LangChainModel:
 
         if self.conversation_chain is None:
             raise ValueError("Conversation model is not configured")
-        return self._invoke(self.conversation_chain, [
-            SystemMessage(CONVERSATION_INSTRUCTIONS),
-            HumanMessage(json.dumps(context, ensure_ascii=False)),
-        ])
+        return self._invoke(
+            self.conversation_chain,
+            [
+                SystemMessage(CONVERSATION_INSTRUCTIONS),
+                HumanMessage(json.dumps(context, ensure_ascii=False)),
+            ],
+        )
 
     # 提取可验证的完成标准，但始终保留用户输入的原始任务目标。
     def plan(self, goal):
@@ -184,6 +192,12 @@ class LangChainModel:
     # 拼接目标、最新观察和短历史；只有支持图片的模型才收到截图。
     def _messages(self, task: Task, observation: Observation, history: list[str], verify=False):
         prompt = INSTRUCTIONS + "\n" + POLICY
+        if task.requirement:
+            from sidecar.app_actions import prompt_hint
+
+            hint = prompt_hint(task.requirement.kind)
+            if hint:
+                prompt += "\n" + hint
         if not self.supports_images:
             prompt += "\nNo image is provided. Use only visible text and supplied element IDs. "
             prompt += "Never infer pixel coordinates; request handoff if visual evidence is needed."

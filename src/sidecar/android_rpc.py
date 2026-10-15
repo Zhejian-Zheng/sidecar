@@ -50,6 +50,16 @@ def app_version(device, package):
         return None
 
 
+def active_ime_package(device):
+    # Device settings, not a package-name substring, establish keyboard identity.
+    try:
+        result = device.shell(["settings", "get", "secure", "default_input_method"])
+        component = result.output.strip()
+        return component.split("/", 1)[0] if result.exit_code == 0 and "/" in component else None
+    except Exception:
+        return None  # Unknown keyboard identity never relaxes the action policy.
+
+
 def run():
     request = json.load(sys.stdin)
     if request.get("display") is not None:
@@ -79,6 +89,7 @@ def run():
             size = getattr(d, "window_size", None)
             width, height = size() if size else (None, None)
             response = dict(
+                active_ime_package=active_ime_package(d),
                 app_version=app_version(d, current["package"]),
                 xml=xml,
                 package=current["package"],
@@ -170,6 +181,7 @@ def display_request(request):
                 out = io.BytesIO()
                 image.save(out, format="PNG")
             return dict(
+                active_ime_package=active_ime_package(device),
                 app_version=app_version(device, package),
                 package=package,
                 activity=activity,

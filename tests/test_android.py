@@ -20,6 +20,9 @@ class Transport:
     def call(self, op, payload=None):
         if op == "observe":
             return dict(
+                active_ime_package=getattr(
+                    self, "active_ime", "com.google.android.inputmethod.latin"
+                ),
                 xml=self.xml,
                 package=self.package,
                 activity="Main",
@@ -262,13 +265,17 @@ def test_send_button_does_not_block_safe_draft_navigation():
 @pytest.mark.parametrize("coordinates", [False, True])
 def test_sensitive_child_protects_entire_clickable_parent(label, coordinates):
     d, t = device()
-    t.xml = ('<hierarchy><node package="com.example.todo" class="Button" clickable="true" '
-             'bounds="[0,0][200,200]"><node text="' + label + '" '
-             'bounds="[0,0][20,20]"/></node></hierarchy>')
+    t.xml = (
+        '<hierarchy><node package="com.example.todo" class="Button" clickable="true" '
+        'bounds="[0,0][200,200]"><node text="' + label + '" '
+        'bounds="[0,0][20,20]"/></node></hierarchy>'
+    )
     obs = d.observe()
-    action = Action(kind="tap", reason="parent", **(
-        {"x": 0.5, "y": 0.25} if coordinates else {"target": next(iter(obs.elements))}
-    ))
+    action = Action(
+        kind="tap",
+        reason="parent",
+        **({"x": 0.5, "y": 0.25} if coordinates else {"target": next(iter(obs.elements))}),
+    )
     assert d.assess(action, obs) == "handoff"
     with pytest.raises(ValueError):
         d.execute(action)
@@ -635,6 +642,7 @@ def test_old_target_is_invalid_after_viewport_or_session_changes():
 )
 def test_keyboard_backspace_does_not_block_overlapping_app_field(keyboard):
     d, t = device()
+    t.active_ime = keyboard
     t.xml = XML.replace(
         "</hierarchy>",
         f'''
@@ -712,3 +720,16 @@ def test_ime_delete_overlap_does_not_block_suggestion_container_or_save():
     save = next(k for k, v in obs.elements.items() if "保存" in v)
     assert d.assess(Action(kind="tap", target=container, reason="mistaken expand"), obs) == "allow"
     assert d.assess(Action(kind="tap", target=save, reason="Save draft"), obs) == "allow"
+
+
+def test_inputmethod_substring_does_not_exempt_foreign_delete_button():
+    d, t = device()
+    t.xml = XML.replace(
+        "</hierarchy>",
+        """<node package="com.example.inputmethod.settings"
+      class="android.widget.Button" content-desc="Delete" bounds="[12,80][60,120]"
+      clickable="true"/></hierarchy>""",
+    )
+    obs = d.observe()
+    target = next(k for k, v in obs.elements.items() if "保存" in v)
+    assert d.assess(Action(kind="tap", target=target, reason="save"), obs) == "handoff"

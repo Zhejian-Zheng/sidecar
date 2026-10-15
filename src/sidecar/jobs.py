@@ -143,8 +143,9 @@ class JobQueue:
     # 对话重试复用已解析目标，并核对原始输入，避免模型再次改写。
     def conversation_result(self, request_id, fingerprint):
         with self.db() as db:
-            row = db.execute("SELECT * FROM conversation_requests WHERE request_id=?",
-                             (request_id,)).fetchone()
+            row = db.execute(
+                "SELECT * FROM conversation_requests WHERE request_id=?", (request_id,)
+            ).fetchone()
         if row is None:
             return None
         if row["fingerprint"] != fingerprint:
@@ -154,8 +155,17 @@ class JobQueue:
         return job
 
     # 校验输入并入队；对话映射与任务在同一事务中保存。
-    def submit(self, goal, items=None, criteria=None, app=None, request_id=None, requirement=None,
-               *, conversation=None):
+    def submit(
+        self,
+        goal,
+        items=None,
+        criteria=None,
+        app=None,
+        request_id=None,
+        requirement=None,
+        *,
+        conversation=None,
+    ):
         request = Submission(
             goal=goal,
             requirement=requirement,
@@ -177,7 +187,7 @@ class JobQueue:
         else:
             package = self.target_package(request.model_dump(), settings)
             if request.requirement is None:
-                from sidecar.verifiers import infer_requirement
+                from sidecar.app_actions import infer_requirement
 
                 request.requirement = infer_requirement(package, request.goal)
             if request.criteria:
@@ -185,9 +195,13 @@ class JobQueue:
         body = request.model_dump_json(exclude={"request_id"})
         with self.db() as db:
             db.execute("BEGIN IMMEDIATE")
-            previous = db.execute(
-                "SELECT * FROM conversation_requests WHERE request_id=?", (request_id,)
-            ).fetchone() if conversation else None
+            previous = (
+                db.execute(
+                    "SELECT * FROM conversation_requests WHERE request_id=?", (request_id,)
+                ).fetchone()
+                if conversation
+                else None
+            )
             if previous and previous["fingerprint"] != conversation["fingerprint"]:
                 raise ValueError("同一个提交编号不能用于不同对话")
             old = db.execute("SELECT * FROM jobs WHERE request_id=?", (request_id,)).fetchone()
@@ -204,9 +218,16 @@ class JobQueue:
                     (task_id, request_id, body, "queued"),
                 )
             if conversation and not previous:
-                db.execute("INSERT INTO conversation_requests VALUES (?,?,?,?,?)",
-                           (request_id, conversation["fingerprint"], conversation["original_goal"],
-                            task_id, conversation["answer"]))
+                db.execute(
+                    "INSERT INTO conversation_requests VALUES (?,?,?,?,?)",
+                    (
+                        request_id,
+                        conversation["fingerprint"],
+                        conversation["original_goal"],
+                        task_id,
+                        conversation["answer"],
+                    ),
+                )
         if conversation:
             return self.conversation_result(request_id, conversation["fingerprint"])
         return self.get(task_id)
