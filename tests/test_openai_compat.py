@@ -815,3 +815,58 @@ def test_embedded_clear_command_does_not_cancel_existing_tasks(tmp_path, goal):
     job = q.submit("original", items=["original"])
     openai_compat.prepare_completion(q, goal)
     assert q.get(job["id"])["status"] == "queued"
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("goal", ["你好", "你好，你是谁", "你是谁？", "Hello!", "你好😀"])
+def test_greeting_is_information_not_device_task(tmp_path, stream, goal, monkeypatch):
+    from types import SimpleNamespace
+
+    from sidecar.model import LangChainModel
+
+    monkeypatch.setattr(LangChainModel, "from_env", lambda: SimpleNamespace(
+        converse=lambda context: {"kind": "reply", "answer": "你好，我是 Sidecar。"}
+    ))
+    from sidecar.jobs import Settings
+
+    q = JobQueue(tmp_path)
+    q.configure(
+        Settings(
+            mode="android",
+            model="test",
+            allowed_packages=["com.google.android.deskclock", "com.google.android.gm"],
+        )
+    )
+    with client(tmp_path) as c:
+        response = c.post(
+            "/v1/chat/completions",
+            headers=auth(),
+            json={"messages": [{"role": "user", "content": goal}], "stream": stream},
+        )
+    assert response.status_code == 200
+    if stream:
+        chunks = [
+            json.loads(line[6:])
+            for line in response.text.splitlines()
+            if line.startswith("data: ") and line != "data: [DONE]"
+        ]
+        text = "".join(
+            chunk["choices"][0].get("delta", {}).get("content", "")
+            for chunk in chunks
+            if chunk.get("choices")
+        )
+    else:
+        text = response.json()["choices"][0]["message"]["content"]
+    assert "Sidecar" in text
+    assert q.list() == []
+
+
+def test_greeting_prefix_does_not_swallow_task(tmp_path):
+    from sidecar.jobs import Settings
+
+    q = JobQueue(tmp_path)
+    q.configure(Settings(mode="android", model="test", package="com.google.android.deskclock"))
+    job, wait = openai_compat.prepare_completion(q, "你好，请在时钟中设置23:58的闹钟")
+    assert wait
+    assert job["status"] == "queued"
+    assert len(q.list()) == 1

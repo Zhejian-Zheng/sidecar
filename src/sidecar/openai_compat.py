@@ -53,7 +53,20 @@ def information(text):
     return {"id": None, "status": "information", "message": text}, False
 
 
-def chat_information(q, goal):
+def chat_information(q, goal, *, legacy_greeting=True):
+    # Match the whole informational utterance, never just a greeting prefix.
+    greeting = re.sub(r"[\s，,。.!！?？、:：😀🙂👋]", "", goal).casefold()
+    if legacy_greeting and re.fullmatch(
+        r"(?:(?:你好|您好|嗨|hello|hi|hey)|"
+        r"(?:你是谁|您是谁|你叫什么名字|介绍一下你自己|whoareyou))+",
+        greeting,
+    ):
+        return information(
+            "你好！我是 Sidecar（伴行），一个通过 Android App 界面执行任务的助手。"
+            "你可以告诉我目标 App 和具体任务，例如：在时钟中设置 23:58 的闹钟。"
+            "发送“帮助”可查看查询、暂停和恢复任务的指令。"
+            "这条问候不会创建任务或操作设备。"
+        )
     if goal in {"帮助", "指令帮助", "help", "/help"}:
         return information(HELP_TEXT)
     if goal in {"任务列表", "查看任务列表", "查看队列", "任务队列"}:
@@ -120,15 +133,25 @@ def submit_goal(q: JobQueue, goal: str, request_id: str):
 
 
 # 在发送响应头前完成校验、去重和入队，确保错误仍可返回正常 HTTP 状态码。
-def prepare_completion(q: JobQueue, goal: str, request_id: str | None = None):
+def prepare_completion(q: JobQueue, goal: str, request_id: str | None = None,
+                       *, messages=None, app=None):
     goal = goal.strip()
+    request_id = request_id or "openai:goal:" + hashlib.sha256(goal.encode()).hexdigest()
+    if messages is not None:
+        from sidecar.conversation import request_fingerprint
+
+        existing = q.conversation_result(request_id, request_fingerprint(messages, app))
+        if existing:
+            return existing, True
     if goal in {"清空队列", "清除任务队列"}:
         result = q.clear()
         text = f"已取消 {result['cancelled']} 个任务。"
         if result["pending"]:
             text += f"另有 {result['pending']} 个执行中的任务已请求取消，等待步骤边界生效。"
         return information(text + "历史记录保留，已执行的操作不会撤销。")
-    if info := chat_information(q, goal):
+    if info := chat_information(
+        q, goal, legacy_greeting=messages is None or q.settings().mode == "demo"
+    ):
         return info
     match = COMMAND_RE.fullmatch(goal)
     if match and (
@@ -161,14 +184,23 @@ def prepare_completion(q: JobQueue, goal: str, request_id: str | None = None):
             "未执行控制操作。请每次提供一个完整任务编号，"
             "例如：取消 <32位任务编号>。发送“帮助”查看用法。"
         )
-    request_id = request_id or "openai:goal:" + hashlib.sha256(goal.encode()).hexdigest()
+    if messages is not None:
+        from sidecar.conversation import respond
+
+        return respond(q, messages, request_id, app=app)
     return submit_goal(q, goal, request_id), True
 
 
 # 非流式调用保持同步等待的原有行为。
-def run_completion(q: JobQueue, goal: str, timeout: float = 120, request_id: str | None = None):
-    job, wait = prepare_completion(q, goal, request_id)
-    return _wait(q, job["id"], timeout) if wait else job
+def run_completion(q: JobQueue, goal: str, timeout: float = 120, request_id: str | None = None,
+                   *, messages=None):
+    job, wait = prepare_completion(q, goal, request_id, messages=messages)
+    if not wait:
+        return job
+    result = _wait(q, job["id"], timeout)
+    if job.get("acknowledgement"):
+        result["acknowledgement"] = job["acknowledgement"]
+    return result
 
 
 def _wait(q: JobQueue, task_id: str, timeout: float):
@@ -192,7 +224,8 @@ def is_demo_job(job, mode=None):
 def result_heading(job, mode=None):
     if job["status"] == "information":
         return ""
-    heading = f"任务编号：{job['id']}\n"
+    acknowledgement = job.get("acknowledgement", "")
+    heading = (acknowledgement + "\n" if acknowledgement else "") + f"任务编号：{job['id']}\n"
     if is_demo_job(job, mode):
         heading += "🧪 离线演示模式：仅模拟记录文字，不会操作手机或真实 App。\n"
     return heading
@@ -341,8 +374,10 @@ def register(app, q: JobQueue, authenticate):
                 body.model_dump(exclude={"stream", "stream_options"}), sort_keys=True
             )
             request_id = "openai:auto:" + hashlib.sha256(payload.encode()).hexdigest()
+        # The offline compatibility endpoint retains its explicit demonstration behavior.
+        messages = body.messages if q.settings().mode != "demo" else None
         if body.stream:
-            job, wait = prepare_completion(q, goal, request_id)
+            job, wait = prepare_completion(q, goal, request_id, messages=messages)
             return StreamingResponse(
                 stream_completion(
                     q,
@@ -355,7 +390,8 @@ def register(app, q: JobQueue, authenticate):
                 media_type="text/event-stream",
                 headers={"X-Accel-Buffering": "no"},
             )
-        job = run_completion(q, goal, timeout=COMPLETION_TIMEOUT, request_id=request_id)
+        job = run_completion(q, goal, timeout=COMPLETION_TIMEOUT, request_id=request_id,
+                             messages=messages)
         return {
             "id": f"chatcmpl-{uuid4().hex}",
             "task_id": job["id"],

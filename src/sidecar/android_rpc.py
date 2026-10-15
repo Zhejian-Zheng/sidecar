@@ -43,6 +43,13 @@ def launch_app(device, package):
 
 
 # 连接指定 Android；读取截图和控件，或把单步动作转换为自动化工具调用。
+def app_version(device, package):
+    try:
+        return device.app_info(package).get("versionName")
+    except Exception:
+        return None
+
+
 def run():
     request = json.load(sys.stdin)
     if request.get("display") is not None:
@@ -72,6 +79,7 @@ def run():
             size = getattr(d, "window_size", None)
             width, height = size() if size else (None, None)
             response = dict(
+                app_version=app_version(d, current["package"]),
                 xml=xml,
                 package=current["package"],
                 activity=current.get("activity", ""),
@@ -162,6 +170,7 @@ def display_request(request):
                 out = io.BytesIO()
                 image.save(out, format="PNG")
             return dict(
+                app_version=app_version(device, package),
                 package=package,
                 activity=activity,
                 xml=xml,

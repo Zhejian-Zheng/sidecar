@@ -96,7 +96,7 @@ def test_android_selection_state_is_visible_and_invalidates_old_action(attribute
     import json
 
     d, t = device()
-    t.xml = XML.replace('text="保存"', f'text="保存" {attribute}="false"')
+    t.xml = XML.replace('text="保存"', f'text="保存" checkable="true" {attribute}="false"')
     before = d.observe()
     target = next(k for k, v in before.elements.items() if "保存" in v)
     assert json.loads(before.elements[target])[attribute] is False
@@ -622,3 +622,93 @@ def test_old_target_is_invalid_after_viewport_or_session_changes():
     action = Action(kind="tap", target=target, reason="test")
     assert not d.is_current(action, before, before.model_copy(update={"viewport": (400, 200)}))
     assert not d.is_current(action, before, before.model_copy(update={"display_session": "new"}))
+
+
+@pytest.mark.parametrize(
+    "keyboard",
+    [
+        "com.google.android.inputmethod.latin",
+        "com.android.inputmethod.latin",
+        "com.samsung.android.honeyboard",
+        "com.example.inputmethod.custom",
+    ],
+)
+def test_keyboard_backspace_does_not_block_overlapping_app_field(keyboard):
+    d, t = device()
+    t.xml = XML.replace(
+        "</hierarchy>",
+        f'''
+    <node package="{keyboard}" class="android.widget.FrameLayout" text=""
+      content-desc="Delete" bounds="[12,80][60,120]" clickable="true"/>
+    </hierarchy>''',
+    )
+    obs = d.observe()
+    target = next(k for k, v in obs.elements.items() if "保存" in v)
+    assert d.assess(Action(kind="tap", target=target, reason="Save draft"), obs) == "allow"
+    assert all("Delete" not in v for v in obs.elements.values())
+    assert "Delete" not in obs.text
+
+
+@pytest.mark.parametrize(
+    "package,label",
+    [
+        ("com.other.app", "Delete"),
+        ("com.google.android.inputmethod.latin", "Delete account"),
+    ],
+)
+def test_backspace_exception_does_not_ignore_other_destructive_controls(package, label):
+    d, t = device()
+    t.xml = XML.replace(
+        "</hierarchy>",
+        f'''
+    <node package="{package}" class="android.widget.FrameLayout"
+      content-desc="{label}" bounds="[12,80][60,120]" clickable="true"/>
+    </hierarchy>''',
+    )
+    obs = d.observe()
+    target = next(k for k, v in obs.elements.items() if "保存" in v)
+    assert d.assess(Action(kind="tap", target=target, reason="Save"), obs) == "handoff"
+
+
+def test_unlabelled_clickable_container_exposes_child_context_for_target_selection():
+    import json
+
+    d, t = device()
+    t.xml = """<hierarchy>
+      <node package="com.example.todo" class="android.widget.RelativeLayout"
+        resource-id="suggestions" bounds="[0,173][200,285]" clickable="true">
+        <node package="com.example.todo" text="Suggestions"/>
+        <node package="com.example.todo" text="Recipient Example"/>
+        <node package="com.example.todo" text="recipient@example.com"/>
+        <node package="com.example.todo" text="secret" password="true"/>
+      </node>
+    </hierarchy>"""
+    obs = d.observe()
+    node = json.loads(next(iter(obs.elements.values())))
+    assert node["container"] is True
+    assert node["child_labels"] == ["Suggestions", "Recipient Example", "recipient@example.com"]
+    assert node["label"] == ""  # Descendant content is context, not a fictitious button name.
+
+
+def test_ime_delete_overlap_does_not_block_suggestion_container_or_save():
+    # Field failure: model picked a large To-suggestions container; IME "Delete"
+    # overlapped it and falsely forced handoff before subject/body could be filled.
+    import json
+
+    d, t = device()
+    t.xml = """<hierarchy>
+      <node package="com.example.todo" class="android.widget.RelativeLayout"
+        resource-id="suggestions" bounds="[0,100][200,280]" clickable="true">
+        <node package="com.example.todo" text="kevin@example.com"/>
+      </node>
+      <node package="com.example.todo" class="android.widget.Button" text="保存"
+        bounds="[10,300][190,340]" clickable="true" enabled="true"/>
+      <node package="com.google.android.inputmethod.latin"
+        class="android.widget.FrameLayout" text="" content-desc="Delete"
+        bounds="[20,200][80,260]" clickable="true"/>
+    </hierarchy>"""
+    obs = d.observe()
+    container = next(k for k, v in obs.elements.items() if json.loads(v).get("container"))
+    save = next(k for k, v in obs.elements.items() if "保存" in v)
+    assert d.assess(Action(kind="tap", target=container, reason="mistaken expand"), obs) == "allow"
+    assert d.assess(Action(kind="tap", target=save, reason="Save draft"), obs) == "allow"

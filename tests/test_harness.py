@@ -654,6 +654,6 @@ def test_final_verification_uses_independent_capture_and_records_provenance(tmp_
     evidence = result["verification"]
     assert evidence["observation_id"] == result["observation"]["id"]
     assert evidence["policy_sha256"] == POLICY_SHA256
-    assert evidence["method"] == "model_with_fresh_observation"
+    assert evidence["method"] == "model_only"
     assert evidence["device_id"] == device.device_id
     assert evidence["verified_at"]

@@ -5,6 +5,24 @@ let token = sessionStorage.getItem('sidecar-token') || '';
 let current = null, config = null, imageUrl = null, busy = false;
 let showFrame = false;
 let lastLiveFrame=0;
+let chatHistory=[];
+let chatGeneration=0;
+try {
+  const saved=JSON.parse(sessionStorage.getItem('sidecar-chat')||'[]');
+  if(Array.isArray(saved)) chatHistory=saved.filter(m=>m && ['user','assistant'].includes(m.role) && typeof m.content==='string').slice(-12);
+} catch (_) { /* Ignore an incomplete browser-session record. */ }
+function renderChat(){
+  $('chat-log').replaceChildren();
+  for(const message of chatHistory){
+    const row=document.createElement('p');
+    row.textContent=(message.role==='user'?'你：':'伴行：')+message.content;
+    $('chat-log').append(row);
+  }
+}
+function clearChat(){
+  chatGeneration++;chatHistory=[];sessionStorage.removeItem('sidecar-chat');renderChat();
+}
+renderChat();
 function selectTask(id){
   if(current!==id){
     lastLiveFrame=0;
@@ -39,6 +57,7 @@ async function connect() {
   $('pairing').hidden=true; $('console').hidden=false; $('error').hidden=true;
   $('connection').textContent=config.worker_online?'执行端已连接':'执行端未启动';
   $('mode-note').textContent=config.mode==='demo'?'离线演示 · 验证任务流程，不操作真实 App':(config.hidden_display?'隐藏执行屏 · ':'Android 执行端 · ')+config.package;
+  $('verification-input').hidden=config.mode!=='android';
   $('demo-input').hidden=config.mode!=='demo'; $('criteria-input').hidden=config.mode==='demo';
   const allowed=config.allowed_packages||[];
   $('app-input').hidden=!(config.mode==='android'&&allowed.length>1);
@@ -155,7 +174,29 @@ $('toggle-preview').onclick=async()=>{
 // 配对表单：阻止整页提交，连接成功后留在当前页面更新内容。
 $('pair-form').onsubmit=async event=>{event.preventDefault();token=$('token').value.trim();try{await connect();}catch(e){fail(e);}};
 // 断开只清除页面会话，不取消已经交给 worker 的任务。
-$('disconnect').onclick=()=>{sessionStorage.removeItem('sidecar-token');token='';config=null;current=null;seen.clear();$('token').value='';$('pairing').hidden=false;$('console').hidden=true;$('connection').textContent='尚未连接';};
+$('disconnect').onclick=()=>{sessionStorage.removeItem('sidecar-token');clearChat();token='';config=null;current=null;seen.clear();$('token').value='';$('pairing').hidden=false;$('console').hidden=true;$('connection').textContent='尚未连接';};
+// Conversation replies render directly; only returned task IDs select an execution view.
+$('chat-form').onsubmit=async event=>{
+  event.preventDefault();
+  const content=$('chat-message').value.trim();
+  if(!content || $('chat-send').disabled)return;
+  const generation=chatGeneration;
+  $('chat-send').disabled=true;$('error').hidden=true;
+  const messages=[...chatHistory,{role:'user',content}];
+  const key=JSON.stringify(['chat',token,messages]);
+  if(!pendingSubmissions.has(key))pendingSubmissions.set(key,crypto.randomUUID?crypto.randomUUID():Date.now()+'-'+Math.random());
+  try{
+    const result=await api('/chat',{method:'POST',body:JSON.stringify({messages,request_id:pendingSubmissions.get(key)})});
+    if(generation!==chatGeneration)return;
+    pendingSubmissions.delete(key);
+    const answer=result.message+(result.task_id && !result.message.includes(result.task_id)?'\n任务编号：'+result.task_id:'');
+    chatHistory=[...messages,{role:'assistant',content:answer}].slice(-12);
+    sessionStorage.setItem('sidecar-chat',JSON.stringify(chatHistory));
+    renderChat();$('chat-message').value='';
+    if(result.task_id){selectTask(result.task_id);await refresh();}
+  }catch(e){if(generation===chatGeneration)fail(e);}
+  finally{$('chat-send').disabled=false;}
+};
 // 提交目标及模式对应的输入，拿到任务编号后展示执行进度。
 $('task-form').onsubmit=async event=>{
   event.preventDefault();
@@ -163,6 +204,9 @@ $('task-form').onsubmit=async event=>{
   $('submit').disabled=true;$('error').hidden=true;
   try{
     const request={goal:$('goal').value,items:config.mode==='demo'?lines('items'):[],criteria:config.mode==='android'?lines('criteria'):[],app:config.mode==='android'?($('app').value||null):null};
+    if(config.mode==='android' && (request.app||config.package)==='com.google.android.deskclock' && $('alarm-time').value){
+      request.requirement={kind:'clock_alarm_enabled',expected_time:$('alarm-time').value};
+    }
     const key=JSON.stringify([token,config.mode,request]);
     if(!pendingSubmissions.has(key))pendingSubmissions.set(key,crypto.randomUUID?crypto.randomUUID():Date.now()+'-'+Math.random());
     request.request_id=pendingSubmissions.get(key);

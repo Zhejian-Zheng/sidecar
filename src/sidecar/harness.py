@@ -113,6 +113,11 @@ class Harness:
     def start(
         self, task: Task, task_id: str | None = None, prepare: Callable[[], None] | None = None
     ) -> dict:
+        if task.requirement is None:
+            from sidecar.verifiers import infer_requirement
+
+            requirement = infer_requirement(getattr(self.device, "package", None), task.goal)
+            task = task.model_copy(update={"requirement": requirement})
         with self.store.execution_lock(), self._device_lock():
             state = State(
                 task_id=task_id or uuid4().hex,
@@ -417,13 +422,46 @@ class Harness:
             "policy_sha256": POLICY_SHA256,
             "device_id": self.device.device_id,
         }
+        model_passed = verification.satisfies(task)
+        program = None
+        if task.requirement:
+            from sidecar.verifiers import evaluate
+
+            try:
+                program = evaluate(task, observation)
+            except Exception:
+                program = {"status": "uncertain", "reason": "程序验证异常，未确认完成",
+                           "observation_id": observation.id, "evidence": []}
+        can_complete = model_passed and (program is None or program["status"] == "passed")
+        evidence.update(
+            model_verification=verification.model_dump(), program_verdict=program,
+            conclusion="completed" if can_complete else "not_completed",
+            method="model_and_program" if task.requirement else "model_only",
+        )
+        # Legacy check consumers must not present model success as the final verdict.
+        if program and program["status"] != "passed":
+            evidence["checks"] = []
+        if program and program["status"] != "passed":
+            evidence["program_attempts"] = (state.get("verification") or {}).get(
+                "program_attempts", 0
+            ) + 1
         self.store.event(state["task_id"], "verification", evidence)
-        if verification.satisfies(task):
+        if can_complete:
             return {
                 "status": "completed",
                 "reason": "All criteria verified",
                 "verification": evidence,
                 "observation": observation.model_dump(),
+            }
+        if program and program["status"] != "passed":
+            attempts = evidence["program_attempts"]
+            return {
+                "status": "waiting_user" if program["status"] == "uncertain" or attempts >= 3
+                          else "running",
+                "reason": "未完成：" + program["reason"],
+                "verification": evidence,
+                "observation": observation.model_dump(),
+                **self._history(state, "Program verification: " + program["reason"]),
             }
         if observation.confirmation_targets and (
             final_action_blocked

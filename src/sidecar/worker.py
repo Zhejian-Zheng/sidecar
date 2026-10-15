@@ -96,6 +96,8 @@ def run_next(home):
                 if request["criteria"]
                 else model.plan(request["goal"])
             )
+        if not saved and request.get("requirement"):
+            task = Task.model_validate({**task.model_dump(), "requirement": request["requirement"]})
         if config.display:
             from sidecar.video import VideoSession
 

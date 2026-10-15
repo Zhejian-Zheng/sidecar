@@ -207,7 +207,25 @@ class AndroidDevice:
             # Scan all clickable parents, including those outside the model's element limit.
             if valid_bounds and attrs.get("clickable") == "true":
                 clickable_bounds.append(bounds)
-            if DESTRUCTIVE.search(haystack):
+            # Gboard/AOSP/etc. expose the text backspace key as "Delete". It is not an
+            # App delete action; its IME-window bounds can overlap App controls.
+            package_name = attrs.get("package", "")
+            ime_backspace = (
+                package_name != self.package
+                and (
+                    "inputmethod" in package_name
+                    or package_name in {
+                        "com.google.android.inputmethod.latin",
+                        "com.android.inputmethod.latin",
+                        "com.samsung.android.honeyboard",
+                    }
+                )
+                and not attrs.get("text")
+                and not attrs.get("resource-id")
+                and attrs.get("content-desc", "").strip().casefold()
+                in {"delete", "backspace", "删除", "退格"}
+            )
+            if DESTRUCTIVE.search(haystack) and not ime_backspace:
                 if valid_bounds:
                     self.blocked_bounds.append(bounds)
                 else:
@@ -221,7 +239,8 @@ class AndroidDevice:
             # Do not expose credentials, including the screenshot, to the model.
             if password:
                 label = "[private input]"
-            if label:
+            # Keep IME key labels out of the model text; they are not App controls.
+            if label and not ime_backspace:
                 state = ""
                 if attrs.get("checkable") == "true":
                     state = f" [checked={str(attrs.get('checked') == 'true').lower()}]"
@@ -247,9 +266,26 @@ class AndroidDevice:
                 bounds=bounds,
                 editable="EditText" in attrs.get("class", ""),
                 focused=attrs.get("focused") == "true",
-                checked=attrs.get("checked") == "true",
+                checked=(attrs.get("checked") == "true"
+                         if attrs.get("checkable") == "true"
+                         and attrs.get("checked") in {"true", "false"} else None),
                 selected=attrs.get("selected") == "true",
             )
+            if not label:
+                # Preserve the distinction between a container and a labelled button.
+                child_labels = []
+                for child in node.iter("node"):
+                    if child is node or child.get("password") == "true":
+                        continue
+                    if child.get("package") != self.package:
+                        continue
+                    text = (child.get("text", "") + " " + child.get("content-desc", "")).strip()
+                    if text and text[:100] not in child_labels:
+                        child_labels.append(text[:100])
+                    if len(child_labels) == 8:
+                        break
+                nodes[key]["container"] = True
+                nodes[key]["child_labels"] = child_labels
             if self.display:
                 nodes[key]["selector"] = dict(
                     resource_id=attrs.get("resource-id", ""),
@@ -281,7 +317,12 @@ class AndroidDevice:
         foreground = data["package"]
         out_of_scope = foreground != self.package
         requires_human = sensitive or out_of_scope
+        from sidecar.verifiers import extract_ui
+
+        ui, truncated = extract_ui(data["xml"]) if not requires_human else ([], True)
         obs = Observation(
+            ui=ui, ui_truncated=truncated, package=foreground,
+            app_version=data.get("app_version"),
             text=(context + "\n".join(lines))[:16000],
             elements={k: json.dumps(v, ensure_ascii=False) for k, v in nodes.items()},
             image=None if requires_human else "data:image/png;base64," + data["image"],

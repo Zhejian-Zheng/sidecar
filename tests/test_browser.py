@@ -29,3 +29,15 @@ def test_preview_does_not_misattribute_delayed_frames_to_another_task():
         capture_output=True, text=True, timeout=10,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_conversation_preserves_retry_and_history_without_creating_tasks_for_replies():
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("Node.js is required for browser controller tests")
+    result = subprocess.run(
+        [node, "tests/browser/conversation.cjs"],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True, text=True, timeout=10,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr

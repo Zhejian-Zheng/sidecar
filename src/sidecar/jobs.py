@@ -11,7 +11,11 @@ from uuid import uuid4
 
 from pydantic import Field, model_validator
 
-from sidecar.contracts import Message, Task
+from sidecar.contracts import (
+    Message,
+    Task,
+    VerificationRequirement,
+)
 from sidecar.displays import DisplayBinding
 from sidecar.execution_control import ExecutionControl
 from sidecar.lifecycle import (
@@ -68,6 +72,7 @@ class Settings(Message):
 
 # 校验网页任务输入；app 指定本任务的目标 App，request_id 用于识别同一次提交的重试。
 class Submission(Message):
+    requirement: VerificationRequirement | None = None
     goal: str = Field(min_length=1, max_length=4000)
     items: list[str] = Field(default_factory=list, max_length=20)
     criteria: list[str] = Field(default_factory=list, max_length=20)
@@ -90,6 +95,9 @@ class JobQueue:
                 note TEXT NOT NULL DEFAULT '', reason TEXT NOT NULL DEFAULT '',
                 created TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)""")
             db.execute("CREATE TABLE IF NOT EXISTS settings (id INTEGER PRIMARY KEY, body TEXT)")
+            db.execute("""CREATE TABLE IF NOT EXISTS conversation_requests (
+                request_id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL,
+                original_goal TEXT NOT NULL, task_id TEXT NOT NULL, answer TEXT NOT NULL)""")
 
     # 每次操作使用短连接；正常提交事务，异常回滚并关闭连接。
     @contextmanager
@@ -132,10 +140,25 @@ class JobQueue:
             raise ValueError(f"目标 App 不在允许列表：{target}")
         return target
 
-    # 校验输入并入队；任务级 app 越界时在提交阶段就拒绝。
-    def submit(self, goal, items=None, criteria=None, app=None, request_id=None):
+    # 对话重试复用已解析目标，并核对原始输入，避免模型再次改写。
+    def conversation_result(self, request_id, fingerprint):
+        with self.db() as db:
+            row = db.execute("SELECT * FROM conversation_requests WHERE request_id=?",
+                             (request_id,)).fetchone()
+        if row is None:
+            return None
+        if row["fingerprint"] != fingerprint:
+            raise ValueError("同一个提交编号不能用于不同对话")
+        job = self.get(row["task_id"])
+        job["acknowledgement"] = row["answer"]
+        return job
+
+    # 校验输入并入队；对话映射与任务在同一事务中保存。
+    def submit(self, goal, items=None, criteria=None, app=None, request_id=None, requirement=None,
+               *, conversation=None):
         request = Submission(
             goal=goal,
+            requirement=requirement,
             items=items or [],
             criteria=criteria or [],
             app=app,
@@ -152,14 +175,25 @@ class JobQueue:
                 raise ValueError("离线演示的每条待办最多 495 字，请缩短任务描述")
             Task(goal=goal, criteria=[PREFIX + x for x in request.items])
         else:
-            self.target_package(request.model_dump(), settings)
+            package = self.target_package(request.model_dump(), settings)
+            if request.requirement is None:
+                from sidecar.verifiers import infer_requirement
+
+                request.requirement = infer_requirement(package, request.goal)
             if request.criteria:
                 Task(goal=goal, criteria=request.criteria)
         body = request.model_dump_json(exclude={"request_id"})
         with self.db() as db:
             db.execute("BEGIN IMMEDIATE")
+            previous = db.execute(
+                "SELECT * FROM conversation_requests WHERE request_id=?", (request_id,)
+            ).fetchone() if conversation else None
+            if previous and previous["fingerprint"] != conversation["fingerprint"]:
+                raise ValueError("同一个提交编号不能用于不同对话")
             old = db.execute("SELECT * FROM jobs WHERE request_id=?", (request_id,)).fetchone()
-            if old:
+            if previous:
+                task_id = previous["task_id"]
+            elif old:
                 if old["body"] != body:
                     raise ValueError("同一个提交编号不能用于不同任务")
                 task_id = old["id"]
@@ -169,6 +203,12 @@ class JobQueue:
                     "INSERT INTO jobs(id,request_id,body,status) VALUES (?,?,?,?)",
                     (task_id, request_id, body, "queued"),
                 )
+            if conversation and not previous:
+                db.execute("INSERT INTO conversation_requests VALUES (?,?,?,?,?)",
+                           (request_id, conversation["fingerprint"], conversation["original_goal"],
+                            task_id, conversation["answer"]))
+        if conversation:
+            return self.conversation_result(request_id, conversation["fingerprint"])
         return self.get(task_id)
 
     # 读取原始队列记录，保留供 worker 使用的请求 JSON。

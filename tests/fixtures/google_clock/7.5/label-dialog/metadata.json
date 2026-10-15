@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "id": "0082fed2b80b4649b442603fb5afb42f",
+  "captured_at": "2026-10-15T08:05:56.919100+00:00",
+  "label": "label-dialog",
+  "source": "device_hierarchy_filtered_to_bound_display",
+  "package": "com.google.android.deskclock",
+  "activity": "com.android.deskclock.DeskClock",
+  "version_name": "7.5",
+  "version_code": "76002074",
+  "display": {
+    "id": 288,
+    "unique_id": "virtual:com.android.shell,2000,scrcpy,286",
+    "boot_id": "116ec8d4-554f-43a8-a886-03735c71c7da"
+  },
+  "viewport": [
+    320,
+    640
+  ],
+  "sdk": "35",
+  "locale": null,
+  "time_12_24": null,
+  "hierarchy_stable_around_screenshot": true,
+  "xml_sha256": "e6d5c0f57e911f2af67c4561941b2783b3a9b52c0bafba89d084c7c2fa96b777",
+  "image_sha256": "ac70096cef871bc5becd933dd13b1e94b56d4eecc833fd63672b28a428ea5322",
+  "limitations": [
+    "Hierarchy equality does not prove absence of overlays or offscreen rows",
+    "Label is collector-supplied, not a verifier verdict"
+  ],
+  "original_capture_label": "label-dialog",
+  "metadata_normalization": "Empty locale and unset time preference normalized to null; XML and PNG unchanged."
+}

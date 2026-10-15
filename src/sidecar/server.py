@@ -17,6 +17,7 @@ from pydantic import Field
 
 from sidecar import openai_compat
 from sidecar.contracts import Message
+from sidecar.conversation import ConversationUnavailable, default_timezone
 from sidecar.jobs import JobQueue, Submission
 from sidecar.store import Store
 
@@ -73,8 +74,15 @@ class Resume(Message):
     note: str = Field(min_length=1, max_length=1000)
 
 
+class ChatInput(Message):
+    messages: list[openai_compat.ChatMessage] = Field(min_length=1, max_length=100)
+    request_id: str = Field(min_length=1, max_length=100)
+    app: str | None = Field(default=None, max_length=200)
+
+
 # 组装页面、鉴权、响应头和任务 API；创建应用本身不会启动 worker。
 def create_app(home, token=None):
+    default_timezone()  # Validate once at startup, before serving any requests.
     q = JobQueue(home)
     secret = token or pairing_token(home)
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
@@ -108,6 +116,19 @@ def create_app(home, token=None):
     @app.exception_handler(ValueError)
     async def invalid(request, exc):
         return JSONResponse({"detail": str(exc)}, status_code=409)
+
+    @app.exception_handler(ConversationUnavailable)
+    async def conversation_unavailable(request, exc):
+        return JSONResponse({"detail": str(exc)}, status_code=503)
+
+    @app.post("/api/chat", dependencies=[Depends(authenticate)])
+    def chat(body: ChatInput):
+        goal = openai_compat.extract_user_goal(body.messages)
+        job, _ = openai_compat.prepare_completion(
+            q, goal, "chat:" + body.request_id, messages=body.messages, app=body.app,
+        )
+        message = openai_compat.format_result(job, mode=q.settings().mode)
+        return {"task_id": job["id"], "message": message, "status": job["status"]}
 
     # OpenAI 兼容端点，供 Cherry Studio 等客户端调用。
     openai_compat.register(app, q, authenticate)

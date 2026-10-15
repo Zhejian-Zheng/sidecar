@@ -2,7 +2,7 @@
 """Validated messages shared by the model, harness, and device adapters."""
 
 import hashlib
-from typing import Literal, Protocol
+from typing import Annotated, Literal, Protocol
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -13,10 +13,46 @@ class Message(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
 
+# 完成门禁按 App 拆分：每个子模型只携带自己的期望字段；kind 用于判别，
+# 新增 App 时只需新增一个子模型并加入下方联合类型，不必改动已有子模型。
+class ClockAlarmRequirement(Message):
+    kind: Literal["clock_alarm_enabled"] = "clock_alarm_enabled"
+    intent: Literal["enable", "disable", "unknown"] = "enable"
+    expected_time: str | None = Field(default=None, pattern=r"^(?:[01]\d|2[0-3]):[0-5]\d$")
+
+
+class GmailDraftRequirement(Message):
+    kind: Literal["gmail_draft_saved"] = "gmail_draft_saved"
+    recipient: str | None = Field(default=None, max_length=200)
+    subject: str | None = Field(default=None, max_length=200)
+    body: str | None = Field(default=None, max_length=4000)
+
+
+VerificationRequirement = Annotated[
+    ClockAlarmRequirement | GmailDraftRequirement,
+    Field(discriminator="kind"),
+]
+
+
+class UINode(Message):
+    node_id: str
+    parent_id: str | None = None
+    resource_id: str = ""
+    klass: str = ""
+    package: str = ""
+    text: str = ""
+    description: str = ""
+    visible: bool | None = None
+    window_id: str | None = None
+    checkable: bool | None = None
+    checked: bool | None = None
+
+
 # 保存用户目标和逐项完成标准，作为规划、执行和验证的共同依据。
 class Task(Message):
     goal: str = Field(min_length=1, max_length=4000)
     criteria: list[str] = Field(min_length=1, max_length=20)
+    requirement: VerificationRequirement | None = None
 
     # 检查完成标准非空、不重复且长度合理，避免无法核对的任务。
     @field_validator("criteria")
@@ -34,6 +70,10 @@ class Observation(Message):
     text: str = Field(max_length=16000)
     elements: dict[str, str] = Field(default_factory=dict, max_length=200)
     image: str | None = Field(default=None, max_length=6_000_000)
+    ui: list[UINode] = Field(default_factory=list, max_length=1000)
+    ui_truncated: bool = False
+    package: str | None = None
+    app_version: str | None = None
     viewport: tuple[int, int] | None = None
     display_session: str | None = None
     requires_human: bool = False
