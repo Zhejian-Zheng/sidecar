@@ -18,7 +18,9 @@
 `VideoSession` 是基础设施层资源管理器，由 worker 在一次任务执行期间持有。
 其目录是 `.sidecar/recordings/<任务编号>/<本轮会话>/`，包括 `recording.mkv`、
 `latest.png` 和 `stream.json`。暂停/等待用户/完成/失败退出本轮；恢复会创建新的目录。
-控制台目前下载最新一轮；更早轮次保留在本地目录。录像包含实际 App 画面，不默认上传知识库。
+控制台目前下载最新一轮；更早轮次保留在本地目录。录像包含实际 App 画面，不默认上传知识库。录制进程有 660 秒硬上限，覆盖当前
+单轮 600 秒执行预算，避免 worker 被强制杀死后无限录制；强制退出可能留下不完整录像，
+需在本地目录检查，不能算正常结束。
 
 两条视频通路各有用途：
 
@@ -64,3 +66,28 @@
 结果仍使用模型依据新观察逐项判断；本次没有声称实现所有 App 的确定性结果验证器，
 也没有自动证明跨设备账号同步、永久保存或用户支付成功。Google 时钟的独立重开核对
 仍按演示指南执行。正式提交仍需录制用户持续操作与 Agent 实时画面同屏的 1–2 分钟视频。
+
+## 本轮验证记录
+
+最终自动化回归：424 passed、4 skipped；4 项为默认关闭的设备测试。
+单独启用本轮 Android 15 视频烟测：1 passed（5.95 秒）。检查连续帧序号推进、
+屏幕会话、主屏前台、录像 H.264 流、正常收尾与无清理错误；结束后 ADB 转发列表为空。
+Ruff 和差异空白检查通过。测试使用真实模拟器，不冒称实体手机或真人持续打字验收。
+
+### Standards 审查
+
+初审发现 2 项：个别进程清理失败会跳过其余清理；网络错误后旧帧可能保留实时标签。
+已分别通过独立资源清理和阶段诊断、网络失败撤销实时标记及浏览器 3 秒超时检测修复。
+补充启动清理失败与离线画面回归，复审剩余发现 0 项。
+
+### Spec 审查
+
+初审发现 1 项：控制台未消费后端共享报告。现已显示共享报告并保留换行，避免重复
+绘制证据列表；completed 与 waiting_user 的浏览器回归通过。复审剩余发现 0 项。
+
+### 上游参考
+
+- [scrcpy 开发架构与 standalone server](https://github.com/Genymobile/scrcpy/blob/master/doc/develop.md)
+- [虚拟屏与输入法策略](https://github.com/Genymobile/scrcpy/blob/master/doc/virtual-display.md)
+- [录制及设备时间戳](https://github.com/Genymobile/scrcpy/blob/master/doc/recording.md)
+- [控制器与画面尺寸映射](https://github.com/Genymobile/scrcpy/blob/master/server/src/main/java/com/genymobile/scrcpy/control/Controller.java)

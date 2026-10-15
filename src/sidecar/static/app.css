@@ -87,3 +87,5 @@ main{padding:24px 14px}
 
 /* 默认隐藏执行画面时，进度和证据使用整列。 */
 .execution-body:has(.screen[hidden]){grid-template-columns:1fr}
+
+.result-summary { white-space: pre-line; overflow-wrap: anywhere; }

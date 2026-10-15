@@ -64,7 +64,8 @@ def test_stream_image_rejects_another_display_session(tmp_path, monkeypatch):
         video.image_from_stream(tmp_path, binding)
 
 
-def test_failed_session_start_releases_started_processes(tmp_path, monkeypatch):
+@pytest.mark.parametrize("stalled", [False, True])
+def test_failed_session_start_releases_started_processes(tmp_path, monkeypatch, stalled):
     from sidecar import displays, video
     from sidecar.displays import DisplayBinding
 
@@ -86,6 +87,7 @@ def test_failed_session_start_releases_started_processes(tmp_path, monkeypatch):
         returncode = None
 
         def __init__(self, *a, **kw):
+            self.index = len(processes)
             self.stdin, self.stdout = io.BytesIO(), io.BytesIO()
             processes.append(self)
 
@@ -98,7 +100,12 @@ def test_failed_session_start_releases_started_processes(tmp_path, monkeypatch):
         def terminate(self):
             self.returncode = -15
 
+        def kill(self):
+            self.returncode = -9
+
         def wait(self, **kw):
+            if stalled and self.index == 1:
+                raise video.subprocess.TimeoutExpired("recorder", 3)
             return self.returncode
 
     monkeypatch.setattr(video.subprocess, "Popen", Process)
@@ -108,4 +115,6 @@ def test_failed_session_start_releases_started_processes(tmp_path, monkeypatch):
         with session:
             pytest.fail("session should not start")
     assert len(processes) == 2 and all(p.returncode is not None for p in processes)
+    if stalled:
+        assert "recorder_shutdown" in session.cleanup_errors
     assert not json.loads((session.directory / "stream.json").read_text())["recording_complete"]

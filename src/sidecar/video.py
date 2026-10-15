@@ -102,6 +102,7 @@ class VideoSession:
         self.connection = None
         self.port = None
         self.threads = []
+        self.cleanup_errors = []
         self.lock = threading.Lock()
         self.meta = {"session_id": self.directory.name, "display": binding.model_dump(),
                      "status": "starting", "sequence": 0, "received_at": 0,
@@ -148,7 +149,7 @@ class VideoSession:
             self.recorder = subprocess.Popen(
                 ["scrcpy", "--serial", self.serial, f"--display-id={self.binding.id}",
                  "--no-window", "--no-audio", "--no-control", "--no-clipboard-autosync",
-                 "--max-size=960", "--max-fps=5", "--video-codec=h264",
+                 "--max-size=960", "--max-fps=5", "--video-codec=h264", "--time-limit=660",
                  "--record=" + str(self.directory / "recording.mkv")],
                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             )
@@ -220,45 +221,61 @@ class VideoSession:
         finally:
             self._publish(status="stopped")
 
-    def __exit__(self, *exc):
-        if self.recorder and self.recorder.poll() is None:
-            self.recorder.send_signal(signal.SIGINT)
+    def _stop_process(self, process, name, interrupt=False):
+        if process is None:
+            return
+        try:
+            if process.poll() is not None:
+                return
+            process.send_signal(signal.SIGINT if interrupt else signal.SIGTERM)
             try:
-                self.recorder.wait(timeout=5)
+                process.wait(timeout=5 if interrupt else 3)
             except subprocess.TimeoutExpired:
-                self.recorder.kill()
-                self.recorder.wait(timeout=5)
+                process.kill()
+                process.wait(timeout=3)
+        except (OSError, subprocess.TimeoutExpired):
+            self.cleanup_errors.append(name + "_shutdown")
+
+    def __exit__(self, *exc):
+        # An individual cleanup failure must not skip other resources or hide the
+        # original task error. Cleanup diagnostics contain stages, never stderr.
+        self._stop_process(self.recorder, "recorder", interrupt=True)
         self.stop.set()
         if self.connection:
-            self.connection.close()
-        if self.server and self.server.poll() is None:
-            self.server.terminate()
             try:
-                self.server.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                self.server.kill()
-                self.server.wait(timeout=3)
+                self.connection.close()
+            except OSError:
+                self.cleanup_errors.append("socket_close")
+        self._stop_process(self.server, "server")
+        self._stop_process(self.decoder, "decoder")
         if self.port:
             from sidecar.displays import run
 
             try:
                 run(["adb", "-s", self.serial, "forward", "--remove", f"tcp:{self.port}"])
             except (RuntimeError, subprocess.TimeoutExpired, OSError):
-                pass
-        if self.decoder and self.decoder.poll() is None:
-            self.decoder.terminate()
-            try:
-                self.decoder.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                self.decoder.kill()
-                self.decoder.wait(timeout=3)
+                self.cleanup_errors.append("forward_remove")
         for thread in self.threads:
-            thread.join(timeout=2)
-        for pipe in ((self.decoder.stdin, self.decoder.stdout) if self.decoder else ()):
-            pipe.close()
-        self._publish(status="stopped", recording_finalized=True, recording_complete=bool(
-            self.recorder and self.recorder.returncode == 0
-            and (self.directory / "recording.mkv").exists()))
+            if thread.ident is not None:
+                thread.join(timeout=2)
+                if thread.is_alive():
+                    self.cleanup_errors.append("thread_join")
+        if self.decoder and not any(t.is_alive() for t in self.threads):
+            for pipe in (self.decoder.stdin, self.decoder.stdout):
+                try:
+                    pipe.close()
+                except (OSError, ValueError):
+                    self.cleanup_errors.append("pipe_close")
+        try:
+            recorder_stopped = bool(self.recorder and self.recorder.poll() is not None)
+            self._publish(status="stopped", recording_finalized=recorder_stopped,
+                          cleanup_errors=self.cleanup_errors,
+                          recording_complete=bool(
+                              recorder_stopped and self.recorder.returncode == 0
+                              and (self.directory / "recording.mkv").exists()
+                          ))
+        except OSError:
+            self.cleanup_errors.append("metadata_write")
 
 
 def image_from_stream(directory, binding):

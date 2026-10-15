@@ -21,8 +21,8 @@ def test_real_stream_recording_and_primary_foreground(tmp_path):
     serial = os.getenv("SIDECAR_TEST_SERIAL", "emulator-5554")
     before = current(serial, 0)
     with hidden_display(serial) as display:
-        launch(serial, display, "com.android.settings")
         with VideoSession(tmp_path, "smoke", serial, display) as video:
+            launch(serial, display, "com.android.settings")
             _, first = latest_frame(video.directory, timeout=15)
             _, second = latest_frame(video.directory, after=time.monotonic(), timeout=8)
             assert second["sequence"] > first["sequence"]
@@ -30,6 +30,7 @@ def test_real_stream_recording_and_primary_foreground(tmp_path):
         meta = json.loads((video.directory / "stream.json").read_text())
         assert meta["recording_complete"] and meta["recording_finalized"]
         assert meta["status"] == "stopped"
+        assert not meta["cleanup_errors"]
         assert current(serial, 0) == before
         if shutil.which("ffprobe"):
             probe = subprocess.run(

@@ -4,6 +4,15 @@ const $ = id => document.getElementById(id);
 let token = sessionStorage.getItem('sidecar-token') || '';
 let current = null, config = null, imageUrl = null, busy = false;
 let showFrame = false;
+let lastLiveFrame=0;
+function selectTask(id){
+  if(current!==id){
+    lastLiveFrame=0;
+    $('frame').removeAttribute('src');$('frame').hidden=true;$('frame-empty').hidden=false;
+    if(imageUrl)URL.revokeObjectURL(imageUrl);imageUrl=null;
+  }
+  current=id;
+}
 // Keep uncertain submissions stable until the server acknowledges them.
 const pendingSubmissions = new Map();
 // 记住上次看到的状态，用于生成页面内提示；这里不提供系统推送。
@@ -53,9 +62,9 @@ async function refresh() {
       const button=document.createElement('button');button.className='task-row'+(job.id===current?' selected':'');
       const title=document.createElement('span');title.className='task-goal';title.textContent=job.request.goal;
       const status=document.createElement('small');status.textContent=labels[job.status]||job.status;
-      button.append(title,status);button.onclick=()=>{current=job.id;refresh();};$('task-list').append(button);
+      button.append(title,status);button.onclick=()=>{selectTask(job.id);refresh();};$('task-list').append(button);
     }
-    if (!current && jobs.length) current=jobs[0].id;
+    if (!current && jobs.length) selectTask(jobs[0].id);
     if (current) await detail(current);
     const health=await api('/config');$('connection').textContent=health.worker_online?'执行端已连接':'执行端未启动，任务保留在队列';
   } catch(e) { fail(e); } finally {busy=false;}
@@ -63,8 +72,9 @@ async function refresh() {
 // 展示所选任务的状态、操作记录和证据；按钮随终态与交接状态变化。
 async function detail(id) {
   const job=await api('/tasks/'+id);
+  if(current!==id)return;
   $('task-title').textContent=job.request.goal;$('task-status').textContent=labels[job.status]||job.status;
-  $('reason').textContent=job.pending_control?('已请求'+(job.pending_control==='pause'?'暂停，请等待确认后再接管':'取消，请等待当前步骤结束')):(job.reason||'任务已保存，等待执行。');
+  $('reason').textContent=job.report || (job.pending_control?('已请求'+(job.pending_control==='pause'?'暂停，请等待确认后再接管':'取消，请等待当前步骤结束')):(job.reason||'任务已保存，等待执行。'));
   $('controls').hidden=terminal.includes(job.status);$('pause').hidden=['paused','waiting_user','interrupted'].includes(job.status);
   $('resume-form').hidden=!['paused','waiting_user','interrupted'].includes(job.status);
   $('events').replaceChildren();
@@ -77,13 +87,13 @@ async function detail(id) {
     if(text){const li=document.createElement('li');li.textContent=text;$('events').append(li);}
   }
   $('evidence').replaceChildren();
-  for(const check of job.state?.verification?.checks||[]) {
+  for(const check of (job.report?[]:job.state?.verification?.checks||[])) {
     const p=document.createElement('p');p.textContent=(check.passed?'✓ ':'○ ')+check.criterion+'：'+check.evidence;$('evidence').append(p);
   }
   const media=await api('/tasks/'+id+'/video');
   if(current!==id)return;
   $('download-recording').hidden=!media.recording_available;
-  $('video-status').textContent=media.status==='live'?'后台画面持续采集中':
+  $('video-status').textContent=media.status==='live'?(lastLiveFrame&&Date.now()-lastLiveFrame<3000?'后台实时画面':'后台采集中，等待新画面'):
     media.status==='stalled'?'画面采集延迟，不能据此确认当前状态':
     media.status==='stopped'?'本轮画面采集已结束'+(media.recording_complete?'':'，录像可能不完整'):
     '暂无实时视频；可查看最近一次任务观察';
@@ -104,10 +114,17 @@ async function refreshFrame(){
       const next=URL.createObjectURL(blob);$('frame').src=next;
       if(imageUrl)URL.revokeObjectURL(imageUrl);imageUrl=next;
       $('frame').hidden=false;$('frame-empty').hidden=true;
+      lastLiveFrame=live?Date.now():0;
       $('frame').alt=live?'后台实时画面':'最近观察截图（非实时）';
       $('video-status').textContent=live?'后台实时画面':'最近观察截图（非实时）';
     }else{$('frame').hidden=true;$('frame-empty').hidden=false;}
-  }catch(e){if(config)fail(e);}finally{frameBusy=false;}
+  }catch(e){
+    if(config&&current===id&&token===auth){
+      lastLiveFrame=0;
+      $('video-status').textContent='连接中断，最后画面非实时';
+      $('frame').alt='连接中断，最后画面非实时';fail(e);
+    }
+  }finally{frameBusy=false;}
 }
 $('download-recording').onclick=async()=>{
   const id=current;
@@ -119,7 +136,14 @@ $('download-recording').onclick=async()=>{
     setTimeout(()=>URL.revokeObjectURL(url),1000);
   }catch(e){fail(e);}
 };
-setInterval(refreshFrame,500);
+setInterval(()=>{
+  if(lastLiveFrame&&Date.now()-lastLiveFrame>3000){
+    lastLiveFrame=0;
+    $('video-status').textContent='画面更新超时，最后画面非实时';
+    $('frame').alt='画面更新超时，最后画面非实时';
+  }
+  refreshFrame();
+},500);
 $('toggle-preview').onclick=async()=>{
   showFrame=!showFrame;
   $('toggle-preview').textContent=showFrame?'隐藏执行画面':'查看执行画面';
@@ -142,7 +166,7 @@ $('task-form').onsubmit=async event=>{
     const key=JSON.stringify([token,config.mode,request]);
     if(!pendingSubmissions.has(key))pendingSubmissions.set(key,crypto.randomUUID?crypto.randomUUID():Date.now()+'-'+Math.random());
     request.request_id=pendingSubmissions.get(key);
-    const job=await api('/tasks',{method:'POST',body:JSON.stringify(request)});pendingSubmissions.delete(key);current=job.id;await refresh();
+    const job=await api('/tasks',{method:'POST',body:JSON.stringify(request)});pendingSubmissions.delete(key);selectTask(job.id);await refresh();
   }catch(e){fail(e);}finally{$('submit').disabled=false;}
 };
 // 暂停或取消只是提交控制请求，页面须等待执行端确认状态。
