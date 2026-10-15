@@ -398,3 +398,16 @@ def test_close_app_does_not_follow_a_task_moved_to_main_display(monkeypatch):
     with pytest.raises(RuntimeError, match="moved"):
         displays.close_app("emulator-test", binding, "com.clock")
     assert not writes
+
+
+def test_resize_after_observation_refuses_input(monkeypatch):
+    from sidecar import displays
+
+    monkeypatch.setattr(displays, "verify", lambda *args: {"width": 640, "height": 320})
+    writes = []
+    monkeypatch.setattr(displays, "shell", lambda *args: writes.append(args))
+    binding = displays.DisplayBinding(id=2, unique_id="test", boot_id="boot")
+    with pytest.raises(RuntimeError, match="resized"):
+        displays.execute("test", binding, {"kind": "tap", "bounds": [1, 2, 30, 40],
+                                           "expected_size": [320, 640]})
+    assert not writes

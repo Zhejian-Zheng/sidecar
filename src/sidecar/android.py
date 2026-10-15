@@ -54,10 +54,11 @@ DEVICE_ENV_KEYS = {
 # 封装设备 RPC 子进程，避免设备调用无限阻塞主执行流程。
 class Transport:
     # 固定目标设备编号，防止多设备连接时误选手机。
-    def __init__(self, serial, display=None, package=None):
+    def __init__(self, serial, display=None, package=None, stream=None):
         self.serial = serial
         self.display = display
         self.package = package
+        self.stream = str(stream) if stream else None
 
     # 通过标准输入传 JSON，限制调用时长；设备写入超时须按结果不确定处理。
     def call(self, op, payload=None):
@@ -75,6 +76,7 @@ class Transport:
                             "payload": payload or {},
                             "display": self.display.model_dump() if self.display else None,
                             "package": self.package,
+                            "stream": self.stream,
                         }
                     ),
                     env={key: value for key, value in os.environ.items()
@@ -171,8 +173,12 @@ class AndroidDevice:
                 fcntl.flock(file, fcntl.LOCK_UN)
 
     # 解析控件树和截图，识别交接条件，并缓存本次可操作控件。
-    def observe(self):
-        data = self.transport.call("observe")
+    def observe_fresh(self):
+        return self.observe(fresh=True)
+
+    def observe(self, fresh=False):
+        data = (self.transport.call("observe", {"fresh": True}) if fresh
+                else self.transport.call("observe"))
         if self.display and data.get("display") != self.display.model_dump():
             raise RuntimeError("Observation does not belong to the configured hidden display")
         root = ET.fromstring(data["xml"])
@@ -281,6 +287,8 @@ class AndroidDevice:
             image=None if requires_human else "data:image/png;base64," + data["image"],
             requires_human=requires_human,
             confirmation_targets=confirmation_targets,
+            viewport=(self.width, self.height) if self.width and self.height else None,
+            display_session=self.display.model_dump_json() if self.display else None,
         )
         self.latest = obs
         return obs
@@ -337,6 +345,8 @@ class AndroidDevice:
 
     # 检查目标控件是否仍有效；坐标动作使用更严格的全界面指纹比较。
     def is_current(self, action, before, after):
+        if before.viewport != after.viewport or before.display_session != after.display_session:
+            return False
         if before.requires_human or after.requires_human:
             return False
         # App and activity must match even if unrelated text or pixels move.
@@ -358,6 +368,9 @@ class AndroidDevice:
         if action.kind == "type" and node is None:
             node = next(v for v in self.nodes.values() if v["editable"] and v["focused"])
         payload = action.model_dump()
+        if self.display:
+            payload["expected_size"] = [self.width, self.height]
+            payload["observation_id"] = self.latest.id
         if node:
             payload["bounds"] = node["bounds"]
             if self.display and action.kind == "type":

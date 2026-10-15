@@ -613,3 +613,12 @@ def test_device_subprocess_receives_adb_config_but_not_model_credentials(monkeyp
     monkeypatch.setattr("sidecar.android.subprocess.run", probe_environment)
     result = DeviceTransport("test-device").call("observe")
     assert result == {"leaked": False, "adb": "tcp:localhost:5037", "path": True}
+
+
+def test_old_target_is_invalid_after_viewport_or_session_changes():
+    d, _ = device()
+    before = d.observe()
+    target = next(iter(before.elements))
+    action = Action(kind="tap", target=target, reason="test")
+    assert not d.is_current(action, before, before.model_copy(update={"viewport": (400, 200)}))
+    assert not d.is_current(action, before, before.model_copy(update={"display_session": "new"}))

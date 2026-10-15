@@ -111,12 +111,22 @@ def filter_hierarchy(xml, display_id):
     return ET.tostring(result, encoding="unicode")
 
 
-def screenshot(serial, binding):
+def screenshot(serial, binding, stream=None):
     # A separate bounded, silent capture client attaches to this logical display.
     # Android's screencap -d uses physical IDs and cannot safely substitute here.
     from PIL import Image
 
     verify(serial, binding)
+    if stream:
+        from sidecar.video import image_from_stream
+
+        try:
+            image = image_from_stream(stream, binding)
+        except TimeoutError:
+            pass  # A stalled preview may use a fresh bounded read, never replay input.
+        else:
+            verify(serial, binding)
+            return image
     with tempfile.TemporaryDirectory(prefix="sidecar-frame-") as temp:
         video = str(Path(temp) / "frame.mkv")
         run(
@@ -158,7 +168,7 @@ def screenshot(serial, binding):
     return image
 
 
-def observe(serial, binding, device):
+def observe(serial, binding, device, stream=None):
     with observation_stage("display_verify"):
         info = verify(serial, binding)
     with observation_stage("foreground"):
@@ -166,9 +176,11 @@ def observe(serial, binding, device):
     with observation_stage("hierarchy"):
         xml = filter_hierarchy(device.dump_hierarchy(), binding.id)
     with observation_stage("screenshot"):
-        image = screenshot(serial, binding)
+        image = screenshot(serial, binding, stream) if stream else screenshot(serial, binding)
     with observation_stage("page_changed"):
-        if current(serial, binding.id) != (package, activity):
+        after = verify(serial, binding)
+        if ((after["width"], after["height"]) != (info["width"], info["height"])
+                or current(serial, binding.id) != (package, activity)):
             raise ObservationError("page_changed")
     return package, activity, xml, image, info
 
@@ -207,8 +219,15 @@ def launch(serial, binding, package):
     raise DeviceSetupError("目标 App 未能在隐藏副屏打开；请核对执行画面")
 
 
+def validate_geometry(info, payload):
+    expected = payload.get("expected_size")
+    if expected is not None and expected != [info["width"], info["height"]]:
+        raise RuntimeError("Display resized since observation; input refused")
+
+
 def execute(serial, binding, payload):
     info = verify(serial, binding)
+    validate_geometry(info, payload)
     kind = payload["kind"]
     prefix = ["input", "-d", str(binding.id)]
     if kind == "tap":
@@ -242,7 +261,8 @@ def set_text(serial, binding, package, payload):
     """One node-scoped write; never retry or fall back to focus/clipboard input."""
     stage = "display_verify"
     try:
-        verify(serial, binding)
+        info = verify(serial, binding)
+        validate_geometry(info, payload)
         stage = "prepare"
         selector = payload.get("selector")
         if not isinstance(selector, dict) or not isinstance(payload.get("text"), str):

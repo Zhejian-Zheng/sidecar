@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 import time
+from contextlib import ExitStack
 from pathlib import Path
 
 from sidecar.contracts import ModelAPIError, Task
@@ -68,6 +69,7 @@ def run_next(home):
     if not job:
         return False
     task_id = job["id"]
+    resources = ExitStack()
     try:
         request = json.loads(job["body"])
         saved = q.state(task_id)
@@ -94,6 +96,13 @@ def run_next(home):
                 if request["criteria"]
                 else model.plan(request["goal"])
             )
+        if config.display:
+            from sidecar.video import VideoSession
+
+            video = resources.enter_context(
+                VideoSession(q.home, task_id, config.serial, config.display)
+            )
+            device.transport.stream = str(video.directory)
         with Harness(q.engine, device, model, max_decisions=50, max_seconds=600) as h:
             # 把启动期间收到的控制请求同步给 Harness，避免请求尚未进入执行状态。
             def prepare():
@@ -134,6 +143,8 @@ def run_next(home):
         else:
             # Never store exception bodies: providers and devices may include secrets.
             q.finish(task_id, "failed", f"执行失败（{type(exc).__name__}），请检查设备和模型配置")
+    finally:
+        resources.close()
     return True
 
 

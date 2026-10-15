@@ -142,7 +142,13 @@ def display_request(request):
             with observation_stage("connection"):
                 device = connect_device(serial)
             try:
-                package, activity, xml, image, info = displays.observe(serial, binding, device)
+                stream = None if request.get("payload", {}).get("fresh") else request.get("stream")
+                if stream:
+                    package, activity, xml, image, info = displays.observe(
+                        serial, binding, device, stream=stream
+                    )
+                else:
+                    package, activity, xml, image, info = displays.observe(serial, binding, device)
             except Exception:
                 # A release failure must not overwrite the original capture failure.
                 with suppress(Exception):

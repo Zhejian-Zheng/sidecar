@@ -85,3 +85,38 @@ def test_event_history_pagination_requires_auth_and_validates_cursor(tmp_path):
         assert c.get(url, headers=headers, params={"limit": 501}).status_code == 422
         assert c.get(url, headers=headers, params={"before": 0}).status_code == 422
         assert c.get('/api/tasks/missing/events', headers=headers).status_code == 404
+
+
+def test_video_and_report_are_authenticated_and_task_scoped(tmp_path):
+    import hashlib
+    import json
+    import time
+
+    from sidecar.jobs import JobQueue
+
+    q = JobQueue(tmp_path)
+    first = q.submit("first", items=["one"])["id"]
+    second = q.submit("second", items=["two"])["id"]
+    folder = tmp_path / "recordings" / first / "123-attempt"
+    folder.mkdir(parents=True)
+    image = b"private-frame"
+    (folder / "latest.png").write_bytes(image)
+    meta = {"status": "live", "received_at": time.monotonic(), "sequence": 1,
+            "session_id": "123-attempt", "sha256": hashlib.sha256(image).hexdigest()}
+    (folder / "stream.json").write_text(json.dumps(meta))
+    (folder / "recording.mkv").write_bytes(b"recorded-video")
+    headers = {"Authorization": "Bearer test-pairing-secret"}
+    with client(tmp_path) as c:
+        for endpoint in ("video", "live-frame", "recording", "report"):
+            assert c.get(f"/api/tasks/{first}/{endpoint}").status_code == 401
+            assert c.get(f"/api/tasks/missing/{endpoint}", headers=headers).status_code == 404
+        assert c.get(f"/api/tasks/{first}/live-frame", headers=headers).content == image
+        assert c.get(f"/api/tasks/{second}/live-frame", headers=headers).status_code == 204
+        assert c.get(f"/api/tasks/{first}/recording", headers=headers).status_code == 409
+        meta.update(status="stopped", recording_complete=True, recording_finalized=True)
+        (folder / "stream.json").write_text(json.dumps(meta))
+        assert c.get(f"/api/tasks/{first}/live-frame", headers=headers).status_code == 204
+        assert c.get(f"/api/tasks/{first}/recording", headers=headers).content == b"recorded-video"
+        report = c.get(f"/api/tasks/{first}/report", headers=headers).json()
+        assert report["verification"] is None
+        assert "尚未开始" in report["text"]

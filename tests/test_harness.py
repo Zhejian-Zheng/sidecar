@@ -619,3 +619,41 @@ def test_text_failure_preserves_stage_and_never_replays(tmp_path):
         event = next(e for e in agent.events(result["task_id"]) if e["kind"] == "uncertain_action")
         assert event["data"]["stage"] == "verification"
         assert event["data"]["operation"] == "text_input"
+
+
+def test_final_verification_uses_independent_capture_and_records_provenance(tmp_path):
+    from sidecar.contracts import Action, Check, Observation, Task, Verification
+    from sidecar.harness import Harness
+    from sidecar.offline import OfflineDevice
+    from sidecar.verification_policy import POLICY_SHA256
+
+    class Device(OfflineDevice):
+        fresh_calls = 0
+
+        def observe(self):
+            return Observation(text="preview says saved")
+
+        def observe_fresh(self):
+            self.fresh_calls += 1
+            return Observation(text="fresh saved record")
+
+    class Model:
+        def decide(self, task, observation, history):
+            return Action(kind="finish", reason="verify result")
+
+        def verify(self, task, observation):
+            assert observation.text == "fresh saved record"
+            return Verification(checks=[Check(criterion="saved", passed=True,
+                                              evidence=observation.text)])
+
+    device = Device(tmp_path)
+    with Harness(tmp_path, device, Model()) as h:
+        result = h.start(Task(goal="save", criteria=["saved"]))
+    assert result["status"] == "completed"
+    assert device.fresh_calls >= 1
+    evidence = result["verification"]
+    assert evidence["observation_id"] == result["observation"]["id"]
+    assert evidence["policy_sha256"] == POLICY_SHA256
+    assert evidence["method"] == "model_with_fresh_observation"
+    assert evidence["device_id"] == device.device_id
+    assert evidence["verified_at"]

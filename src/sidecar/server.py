@@ -2,10 +2,12 @@
 """Authenticated phone console. The independent worker owns execution."""
 
 import base64
+import json
 import os
 import secrets
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
@@ -146,6 +148,7 @@ def create_app(home, token=None):
     @app.get("/api/tasks/{task_id}", dependencies=[Depends(authenticate)])
     def status(task_id: str):
         result = q.get(task_id)
+        result["report"] = openai_compat.format_result(result, mode=q.settings().mode)
         if result["state"]:
             result["state"] = {k: v for k, v in result["state"].items() if k != "observation"}
         result["events"] = q.events(task_id)
@@ -171,6 +174,61 @@ def create_app(home, token=None):
         return Response(
             base64.b64decode(data), media_type="image/png" if "png" in prefix else "image/jpeg"
         )
+
+    # Media is task-scoped and protected by the same pairing token as task state.
+    def video_directory(task_id):
+        from sidecar.video import session_directory
+
+        q.get(task_id)
+        return session_directory(q.home, task_id)
+
+    @app.get("/api/tasks/{task_id}/video", dependencies=[Depends(authenticate)])
+    def video_status(task_id: str):
+        directory = video_directory(task_id)
+        if directory is None:
+            return {"status": "unavailable", "recording_available": False}
+        meta = json.loads((directory / "stream.json").read_text())
+        if meta["status"] == "live" and not 0 <= time.monotonic() - meta["received_at"] < 3:
+            meta["status"] = "stalled"
+        meta["recording_available"] = (
+            meta.get("recording_finalized", False) and (directory / "recording.mkv").exists()
+        )
+        return meta
+
+    @app.get("/api/tasks/{task_id}/live-frame", dependencies=[Depends(authenticate)])
+    def live_frame(task_id: str):
+        from sidecar.video import latest_frame
+
+        directory = video_directory(task_id)
+        if directory is None:
+            return Response(status_code=204)
+        try:
+            data, meta = latest_frame(directory)
+        except TimeoutError:
+            return Response(status_code=204)
+        return Response(data, media_type="image/png", headers={
+            "X-Frame-Sequence": str(meta["sequence"]),
+            "X-Video-Session": meta["session_id"],
+        })
+
+    @app.get("/api/tasks/{task_id}/recording", dependencies=[Depends(authenticate)])
+    def recording(task_id: str):
+        directory = video_directory(task_id)
+        if directory is None or not (directory / "recording.mkv").exists():
+            raise HTTPException(404, "还没有任务录像")
+        meta = json.loads((directory / "stream.json").read_text())
+        if not meta.get("recording_finalized", False):
+            raise HTTPException(409, "录像尚未结束，请在本轮执行结束后下载")
+        suffix = "" if meta.get("recording_complete") else "-incomplete"
+        return FileResponse(directory / "recording.mkv", media_type="video/x-matroska",
+                            filename=f"{task_id}-{directory.name}{suffix}.mkv")
+
+    @app.get("/api/tasks/{task_id}/report", dependencies=[Depends(authenticate)])
+    def report(task_id: str):
+        job = q.get(task_id)
+        return {"task_id": task_id, "status": job["status"],
+                "text": openai_compat.format_result(job, mode=q.settings().mode),
+                "verification": (job["state"] or {}).get("verification")}
 
     # 提交暂停请求，实际停止需要等待执行流程到达步骤边界。
     @app.post("/api/tasks/{task_id}/pause", dependencies=[Depends(authenticate)])

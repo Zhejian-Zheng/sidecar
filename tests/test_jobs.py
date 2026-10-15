@@ -337,7 +337,21 @@ def test_worker_closes_finished_hidden_app_but_keeps_handoff(
             if cleanup_failure:
                 raise RuntimeError("device unavailable")
 
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+
+    video_closed = []
+
+    @contextmanager
+    def video_session(*args):
+        try:
+            yield SimpleNamespace(directory=tmp_path / "video")
+        finally:
+            video_closed.append(True)
+
+    monkeypatch.setattr("sidecar.video.VideoSession", video_session)
     device = Device(tmp_path / "engine")
+    device.transport = SimpleNamespace(stream=None)
     state = device.load()
     state["logged_in"] = not handoff
     device.save(state)
@@ -356,6 +370,7 @@ def test_worker_closes_finished_hidden_app_but_keeps_handoff(
     )
     job = q.submit("task", criteria=[PREFIX + "test"])
     run_next(tmp_path)
+    assert video_closed == [True]
     assert q.get(job["id"])["status"] == ("waiting_user" if handoff else "completed")
     assert device.closed is not handoff
     assert any(e["kind"] == "cleanup_error" for e in q.events(job["id"])) == (

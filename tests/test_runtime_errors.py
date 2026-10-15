@@ -37,7 +37,10 @@ def test_observation_failure_survives_rpc_and_is_saved_safely(
     monkeypatch.setattr(
         android_rpc, "connect_device", lambda serial: fail() if failure == "connect" else device
     )
-    monkeypatch.setattr(displays, "verify", lambda *args: fail() if failure == "verify" else {})
+    monkeypatch.setattr(
+        displays, "verify",
+        lambda *args: fail() if failure == "verify" else {"width": 320, "height": 640},
+    )
     reads = []
 
     def current(*args):

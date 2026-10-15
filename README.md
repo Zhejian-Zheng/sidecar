@@ -225,6 +225,32 @@ sidecar --home ~/.sidecar/android-clock cancel <任务ID>
 
 不能把旧副屏上的暂停任务直接恢复到新副屏；应核对已产生的结果后提交新任务，避免重复写入。主副屏仍共享账号、音频和部分系统能力，本轮没有验收 Amazon、登录/支付或任意 App 的隔离效果。
 
+## 设备权限与普通用户落地
+
+### 当前原型使用的权限
+
+当前演示使用 **Mac 上的 Android 15 模拟器 + 已授权的 ADB 连接 + 隐藏虚拟副屏**。项目代码不要求执行 `adb root` 或 `su`，不要求系统签名、解锁 Bootloader、修改 ROM 或 iPhone 越狱。这是当前实现的权限需求说明，不代表已经在所有非 Root 真机上完成验收。
+
+| 能力 | 当前使用方式与前置条件 |
+| --- | --- |
+| 设备连接与控制 | 由宿主 Mac 通过 ADB 连接 Android；使用真机时需用户开启开发者选项、USB 调试并授权该电脑，设备策略也必须允许调试 |
+| 获取界面与执行动作 | 使用 uiautomator2 / UiAutomation 和 ADB shell；执行端 App 由用户安装并完成账号登录 |
+| 隐藏副屏 | scrcpy 创建虚拟显示屏；当前代码要求 Android 15（API 35）或以上，已验证环境为本机模拟器 |
+| 副屏定向输入 | 通过 ADB 将随包分发的 `textbridge.jar` 放入 `/data/local/tmp/`，再用 `app_process` 在 shell 环境执行；利用 UiAutomation 定位控件并设置文字 |
+| 系统内部接口 | 输入桥接初始化使用 Android 隐藏 API；它不是仅靠普通 App 运行时权限即可获得的能力，系统或厂商版本变化后须重新验收 |
+
+桥接程序本身不安装常驻输入法或无障碍 App，也不监听网络端口；这不等于整个设备工具链没有辅助组件。当前授权来自 ADB 调试链路，不能将其表述为“用户从应用商店安装一个普通 App 就能无授权控制其他 App”。主副屏仍共享账号、音频和部分系统能力，焦点、输入法及系统弹窗的隔离需在目标设备和 App 上验证。
+
+### 普通用户如何使用
+
+**近期方案：配对一个由用户控制的桌面执行端。** 用户在 Mac 上准备 Android 执行环境，安装目标 App 并亲自登录；Sidecar 在桌面端运行，手机通过可信局域网中的网页提交任务、查看进度、暂停或取消。Android 模拟器承担 App 操作，因此用户日常手机不需要 Root 或越狱。当前仍需手动配置环境；一键安装、初始化向导和更方便的人工接管属于后续产品化工作，不能作为已实现能力。
+
+结果必须明确归属执行端的 App 和账号。若要在日常手机中使用结果，应选择支持同账号同步的 App，并实际验证同步；当前 Google 时钟演示创建的是 Android 执行实例内的闹钟，**不会变成 iPhone 的系统闹钟**。
+
+**同机 Android 真机路线：待验证的扩展。** 可以在用户主动授权 ADB 的测试真机上评估同机副屏，但必须逐项验收厂商系统、虚拟显示、隐藏 API、触摸与键盘焦点、目标 App 兼容性以及调试授权的生命周期。目前不能承诺脱离电脑后持续可用，也不能承诺任意普通手机安装即用。如果未来改用系统签名、Root 或定制 ROM，需要单独记录新增权限与部署成本；当前项目没有采用这些路径。
+
+答辩时可概括为：**原型通过用户授权的 ADB 获得开发者级设备控制能力，在独立副屏操作真实 App；近期以桌面执行端配合手机入口落地。同机普通真机的广泛兼容和免配置体验尚需验证。**
+
 ## 代码结构与设备接入
 
 | 文件 | 内容 |
@@ -396,3 +422,15 @@ iOS 模拟器不能按普通 iPhone 的方式直接安装任意 App Store App。
 - [Apple：模拟器交互与 App 安装限制（归档文档）](https://developer.apple.com/library/archive/documentation/IDEs/Conceptual/iOS_Simulator_Guide/InteractingwiththeiOSSimulator/InteractingwiththeiOSSimulator.html)
 - [Apple：在 Mac 上运行 iOS App](https://developer.apple.com/documentation/apple-silicon/running-your-ios-apps-in-macos)
 - [Android Emulator 官方说明](https://developer.android.com/studio/run/emulator)
+
+### 后台实时画面与执行录像
+
+隐藏副屏任务现在会持续采集画面，并为每一轮执行/恢复保存独立录像。
+控制台“查看执行画面”区分实时画面与历史截图；本轮结束后可下载录像。
+媒体和结果报告均受配对令牌保护。录像保存在
+`.sidecar/recordings/<任务编号>/<本轮会话>/`，不会默认上传到知识库。
+
+需要 PATH 中的 adb、scrcpy、FFmpeg；非标准 scrcpy 安装可用
+`SCRCPY_SERVER_PATH` 指定与 CLI 版本一致的服务端文件。当前实测 scrcpy 5.0.1。
+普通观察复用视频流，执行前及最终验证仍使用独立新截图；视频本身不决定任务成功。
+详见 [升级说明与验证边界](docs/video-upgrade.md)。

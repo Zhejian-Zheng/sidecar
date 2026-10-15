@@ -265,8 +265,10 @@ class Harness:
         return {"status": change.status, "reason": change.reason} if change else {}
 
     # 读取新界面并记录简要观察事件，截图仍保存在观察数据中。
-    def _capture(self, state):
-        observation = self.device.observe()
+    def _capture(self, state, fresh=False):
+        capture = (getattr(self.device, "observe_fresh", self.device.observe)
+                   if fresh else self.device.observe)
+        observation = capture()
         self.store.event(
             state["task_id"],
             "observation",
@@ -330,7 +332,7 @@ class Harness:
         if stop := self._boundary(state):
             return stop
         action = Action.model_validate(state["action"])
-        observation = self._capture(state)
+        observation = self._capture(state, fresh=True)
         if observation.requires_human:
             return {
                 "status": "waiting_user",
@@ -393,7 +395,7 @@ class Harness:
     def _verify(self, state, final_action_blocked=False):
         if stop := self._boundary(state):
             return stop
-        observation = self._capture(state)
+        observation = self._capture(state, fresh=True)
         if observation.requires_human:
             return {"status": "waiting_user", "reason": "Verification needs user intervention"}
         task = Task.model_validate(state["task"])
@@ -403,7 +405,18 @@ class Harness:
         verification = Verification.model_validate(value)
         if stop := self._boundary(state):
             return stop
-        evidence = {**verification.model_dump(), "observation_id": observation.id}
+        from datetime import datetime, timezone
+
+        from sidecar.verification_policy import POLICY_SHA256
+
+        evidence = {
+            **verification.model_dump(), "observation_id": observation.id,
+            "method": "model_with_fresh_observation", "viewport": observation.viewport,
+            "display_session": observation.display_session,
+            "verified_at": datetime.now(timezone.utc).isoformat(),
+            "policy_sha256": POLICY_SHA256,
+            "device_id": self.device.device_id,
+        }
         self.store.event(state["task_id"], "verification", evidence)
         if verification.satisfies(task):
             return {

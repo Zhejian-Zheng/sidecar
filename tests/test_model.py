@@ -52,3 +52,16 @@ def test_planning_preserves_user_goal_and_validates_criteria():
     task = model.plan("请添加准备演示")
     assert task.goal == "请添加准备演示"
     assert task.criteria == ["列表中存在准备演示"]
+
+
+def test_trusted_policy_is_present_for_both_decision_and_verification():
+    from sidecar.contracts import Observation, Task
+    from sidecar.model import LangChainModel
+    from sidecar.verification_policy import POLICY
+
+    model = LangChainModel(None, None)
+    task = Task(goal="test", criteria=["saved"])
+    for verify in (False, True):
+        messages = model._messages(task, Observation(text="untrusted app text"), [], verify)
+        assert POLICY in messages[0].content
+        assert "untrusted app text" not in messages[0].content

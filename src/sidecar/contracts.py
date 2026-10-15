@@ -34,6 +34,8 @@ class Observation(Message):
     text: str = Field(max_length=16000)
     elements: dict[str, str] = Field(default_factory=dict, max_length=200)
     image: str | None = Field(default=None, max_length=6_000_000)
+    viewport: tuple[int, int] | None = None
+    display_session: str | None = None
     requires_human: bool = False
     # Identified controls that the executor must leave to the user.
     confirmation_targets: dict[str, str] = Field(default_factory=dict, max_length=200)

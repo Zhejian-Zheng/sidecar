@@ -80,24 +80,53 @@ async function detail(id) {
   for(const check of job.state?.verification?.checks||[]) {
     const p=document.createElement('p');p.textContent=(check.passed?'✓ ':'○ ')+check.criterion+'：'+check.evidence;$('evidence').append(p);
   }
-  // 用户主动打开预览才获取图片；隐藏预览不影响 worker 执行。
+  const media=await api('/tasks/'+id+'/video');
+  if(current!==id)return;
+  $('download-recording').hidden=!media.recording_available;
+  $('video-status').textContent=media.status==='live'?'后台画面持续采集中':
+    media.status==='stalled'?'画面采集延迟，不能据此确认当前状态':
+    media.status==='stopped'?'本轮画面采集已结束'+(media.recording_complete?'':'，录像可能不完整'):
+    '暂无实时视频；可查看最近一次任务观察';
   $('screen-panel').hidden=!showFrame;
-  if (!showFrame) return;
-  // 截图也单独鉴权；替换图片时释放旧 Blob 地址，避免持续刷新占用内存。
-  const response=await fetch('/api/tasks/'+id+'/frame',{headers:{Authorization:'Bearer '+token}});
-  if (!showFrame || current!==id || !config) return;
-  if(response.status===200) {
-    const next=URL.createObjectURL(await response.blob());$('frame').src=next;if(imageUrl)URL.revokeObjectURL(imageUrl);imageUrl=next;
-    $('frame').hidden=false;$('frame-empty').hidden=true;
-  } else {$('frame').hidden=true;$('frame-empty').hidden=false;}
 }
+let frameBusy=false;
+async function refreshFrame(){
+  if(frameBusy||!showFrame||!current||!config||document.hidden)return;
+  frameBusy=true;
+  const id=current, auth=token;
+  try{
+    let response=await fetch('/api/tasks/'+id+'/live-frame',{headers:{Authorization:'Bearer '+auth}});
+    const live=response.status===200;
+    if(response.status===204)response=await fetch('/api/tasks/'+id+'/frame',{headers:{Authorization:'Bearer '+auth}});
+    const blob=response.status===200?await response.blob():null;
+    if(!showFrame||current!==id||token!==auth||!config)return;
+    if(blob){
+      const next=URL.createObjectURL(blob);$('frame').src=next;
+      if(imageUrl)URL.revokeObjectURL(imageUrl);imageUrl=next;
+      $('frame').hidden=false;$('frame-empty').hidden=true;
+      $('frame').alt=live?'后台实时画面':'最近观察截图（非实时）';
+      $('video-status').textContent=live?'后台实时画面':'最近观察截图（非实时）';
+    }else{$('frame').hidden=true;$('frame-empty').hidden=false;}
+  }catch(e){if(config)fail(e);}finally{frameBusy=false;}
+}
+$('download-recording').onclick=async()=>{
+  const id=current;
+  try{
+    const response=await fetch('/api/tasks/'+id+'/recording',{headers:{Authorization:'Bearer '+token}});
+    if(!response.ok)throw new Error('录像暂不可下载，请等待本轮执行结束');
+    const url=URL.createObjectURL(await response.blob());
+    const link=document.createElement('a');link.href=url;link.download=(response.headers.get('Content-Disposition')||'').match(/filename="([^"]+)"/)?.[1]||id+'.mkv';link.click();
+    setTimeout(()=>URL.revokeObjectURL(url),1000);
+  }catch(e){fail(e);}
+};
+setInterval(refreshFrame,500);
 $('toggle-preview').onclick=async()=>{
   showFrame=!showFrame;
   $('toggle-preview').textContent=showFrame?'隐藏执行画面':'查看执行画面';
   $('toggle-preview').setAttribute('aria-expanded',String(showFrame));
   $('screen-panel').hidden=!showFrame;
   if(!showFrame){$('frame').removeAttribute('src');if(imageUrl)URL.revokeObjectURL(imageUrl);imageUrl=null;}
-  else if(current){try{await detail(current);}catch(e){fail(e);}}
+  else if(current){try{await detail(current);await refreshFrame();}catch(e){fail(e);}}
 };
 // 配对表单：阻止整页提交，连接成功后留在当前页面更新内容。
 $('pair-form').onsubmit=async event=>{event.preventDefault();token=$('token').value.trim();try{await connect();}catch(e){fail(e);}};
